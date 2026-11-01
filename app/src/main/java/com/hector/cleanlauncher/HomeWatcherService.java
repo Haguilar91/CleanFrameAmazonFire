@@ -105,6 +105,29 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         stayOnAmazon = false;
     }
 
+    /** Fast Home key detection is on unless the user switched it to Basic. */
+    static boolean keyFast(Context c) {
+        return c.getSharedPreferences("home", MODE_PRIVATE).getBoolean("keyFast", true);
+    }
+
+    /** Apply the Fast/Basic choice now. */
+    static void refreshKeyWatch() {
+        HomeWatcherService s = instance;
+        if (s == null) return;
+        if (keyFast(s)) {
+            s.bindKeyWatcher();
+        } else if (s.keyWatchBound) {
+            try { s.unbindService(s.keyWatch); } catch (Exception ignored) { }
+            s.keyWatchBound = false;
+        }
+    }
+
+    /** Opening Fire TV's own screens: some live in Amazon's home package, so don't cover them. */
+    static void leaveForAmazon() {
+        stayOnAmazon = true;
+        hideCover();
+    }
+
     /** The Home item focused on the cover, so MainActivity can carry on from it. */
     static String coverFocus() {
         HomeWatcherService s = instance;
@@ -322,7 +345,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     @Override
     public void launch(AppEntry a) {
         if (ADD.equals(a.pkg)) {
-            openPanel(OPEN_LIBRARY);
+            openPanel(MainActivity.OPEN_ADD);
             return;
         }
         // Fire OS queues this start until its hold is over. Keep covering Amazon's home until
@@ -373,7 +396,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     };
 
     private void bindKeyWatcher() {
-        if (keyWatchBound || !HomeKeyWatcher.permitted(this)) return;
+        if (keyWatchBound || !keyFast(this) || !HomeKeyWatcher.permitted(this)) return;
         try {
             keyWatchBound = bindService(new Intent(this, HomeKeyWatcher.class), keyWatch,
                     BIND_AUTO_CREATE);

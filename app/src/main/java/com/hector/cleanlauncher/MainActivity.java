@@ -49,7 +49,7 @@ public class MainActivity extends Activity implements HomeView.Host {
     /** Intent extra from HomeWatcherService: a panel to open once we are in front. */
     static final String EXTRA_OPEN = "open";
     static final String OPEN_LIBRARY = "library", OPEN_SETTINGS = "settings",
-            OPEN_WALLPAPERS = "wallpapers", OPEN_MENU = "menu:";
+            OPEN_WALLPAPERS = "wallpapers", OPEN_MENU = "menu:", OPEN_ADD = "add";
 
     /** Monochrome service marks, keyed by Fire TV package name. */
     static final Map<String, Integer> BRANDS = new HashMap<>();
@@ -106,6 +106,8 @@ public class MainActivity extends Activity implements HomeView.Host {
     private FrameLayout overlay;          // the open panel, if any
     private boolean overlayIsWallpaper;
     private GridLayout libraryGrid;
+    /** The library was opened from "Add": selecting an app toggles it on Home instead of opening it. */
+    private boolean pickingForHome;
     private TextView pickerName, pickerCredit;
 
     private final BroadcastReceiver packages = new BroadcastReceiver() {
@@ -195,6 +197,10 @@ public class MainActivity extends Activity implements HomeView.Host {
         if (open == null) return;
         intent.removeExtra(EXTRA_OPEN);
         if (OPEN_LIBRARY.equals(open)) openLibrary();
+        else if (OPEN_ADD.equals(open)) {
+            openLibrary();
+            pickingForHome = true;
+        }
         else if (OPEN_SETTINGS.equals(open)) openSettings();
         else if (OPEN_WALLPAPERS.equals(open)) openWallpapers();
         else if (open.startsWith(OPEN_MENU)) {
@@ -230,6 +236,13 @@ public class MainActivity extends Activity implements HomeView.Host {
     public void launch(AppEntry a) {
         if (ADD.equals(a.pkg)) {
             openLibrary();
+            pickingForHome = true;
+            return;
+        }
+        if (pickingForHome && libraryGrid != null) {
+            // Opened from "Add": selecting an app adds it to (or removes it from) Home.
+            hv.toggleHome(a.pkg);
+            fillLibrary(a.pkg);
             return;
         }
         try {
@@ -300,6 +313,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         overlay = null;
         overlayIsWallpaper = false;
         libraryGrid = null;
+        pickingForHome = false;
         hv.applyHomeLayout();
         hv.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
         if (refocus) hv.focusDock(false);
@@ -321,8 +335,10 @@ public class MainActivity extends Activity implements HomeView.Host {
     @Override
     public void openLibrary() {
         FrameLayout o = openOverlay(true);
+        pickingForHome = false;
         title(o, "Apps");
         TextView hint = text("Hold select or press ☰ to add to Home", 14, false, MUTE);
+        hint.setTag("hint");
         hint.setGravity(Gravity.CENTER_VERTICAL);
         FrameLayout.LayoutParams hp = new FrameLayout.LayoutParams(-2, dp(32), Gravity.TOP | Gravity.END);
         hp.rightMargin = dp(56);
@@ -434,8 +450,18 @@ public class MainActivity extends Activity implements HomeView.Host {
         list.addView(settingRow("Open Amazon home", "", v -> openAmazonHome()));
         final boolean on = watcherEnabled();
         list.addView(settingRow("Home button service", on ? "On" : "Off", v -> showServiceHelp(on)));
-        final boolean fast = HomeKeyWatcher.permitted(this);
-        list.addView(settingRow("Home key detection", fast ? "Fast" : "Basic", v -> showKeyHelp(fast)));
+        final boolean allowed = HomeKeyWatcher.permitted(this);
+        list.addView(settingRow("Home key detection",
+                allowed && HomeWatcherService.keyFast(this) ? "Fast" : "Basic", v -> {
+            if (!allowed) {
+                showKeyHelp(false);
+                return;
+            }
+            boolean fast = !HomeWatcherService.keyFast(this);
+            prefs.edit().putBoolean("keyFast", fast).apply();
+            ((TextView) v.findViewWithTag("value")).setText(fast ? "Fast" : "Basic");
+            HomeWatcherService.refreshKeyWatch();
+        }));
         String homePkg = prefs.getString("homePkg", null);
         list.addView(settingRow("Detect Home screen", homePkg != null ? homePkg : "Automatic", v -> {
             if (!watcherEnabled()) {
@@ -445,9 +471,13 @@ public class MainActivity extends Activity implements HomeView.Host {
             prefs.edit().putLong("learnUntil", System.currentTimeMillis() + 15000).apply();
             Toast.makeText(this, "Press Home on the remote now", Toast.LENGTH_LONG).show();
         }));
-        list.addView(settingRow("Edit Home apps", "", v -> openLibrary()));
+        list.addView(settingRow("Edit Home apps", "", v -> {
+            openLibrary();
+            pickingForHome = true;
+        }));
         list.addView(settingRow("Fire TV settings", "", v -> {
             try {
+                HomeWatcherService.leaveForAmazon();
                 startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             } catch (Exception ignored) { }
         }));

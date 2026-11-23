@@ -21,6 +21,8 @@ public class GlassView extends FrameLayout {
 
     static Bitmap blur;
     static boolean lightTone;
+    /** Dark mode: an extra shade over every glass panel. */
+    static boolean dark;
 
     private final float radius;
     private final boolean scrim;
@@ -35,6 +37,8 @@ public class GlassView extends FrameLayout {
     private final int[] loc = new int[2];
     private Bitmap shaderFor;
     private BitmapShader shader;
+    private LinearGradient scrimShader;
+    private int scrimFor = -1;
 
     public GlassView(Context c, float radiusPx, boolean scrim) {
         super(c);
@@ -78,8 +82,16 @@ public class GlassView extends FrameLayout {
         fill.setShader(null);
         fill.setColor(lightTone ? veilLight : veilDark);
         c.drawRoundRect(rect, radius, radius, fill);
+        if (dark) {
+            fill.setColor(0x66000000);
+            c.drawRoundRect(rect, radius, radius, fill);
+        }
         if (scrim) {
-            fill.setShader(new LinearGradient(0, 0, 0, h, 0x00040A0C, 0x45040A0C, Shader.TileMode.CLAMP));
+            if (scrimShader == null || scrimFor != h) {
+                scrimShader = new LinearGradient(0, 0, 0, h, 0x00040A0C, 0x45040A0C, Shader.TileMode.CLAMP);
+                scrimFor = h;
+            }
+            fill.setShader(scrimShader);
             c.drawRoundRect(rect, radius, radius, fill);
             fill.setShader(null);
         }

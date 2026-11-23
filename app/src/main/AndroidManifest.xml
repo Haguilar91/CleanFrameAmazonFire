@@ -3,6 +3,12 @@
 
     <!-- Granted over ADB by install.sh; lets HomeKeyWatcher see Home presses early. -->
     <uses-permission android:name="android.permission.READ_LOGS" />
+    <!-- Network name under the clock. Android 9 only reveals the Wi-Fi name to apps with the
+         location permission; install.sh grants it, or Settings › Wi-Fi network asks. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

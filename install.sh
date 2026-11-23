@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: ./install.sh [firetv-ip] [apk]
 set -e
-IP="${1:-192.168.50.231}"
+IP="${1:-192.168.1.126}"
 APK="${2:-CleanLauncher.apk}"
 DEV="$IP:5555"
 PKG=com.hector.cleanlauncher
@@ -20,5 +20,7 @@ adb -s "$DEV" shell settings put secure accessibility_enabled 1
 # Optional: lets Clean Launcher see Home presses in the system log (faster, and catches
 # Home pressed while Amazon's home is showing). Undo with: pm revoke $PKG android.permission.READ_LOGS
 adb -s "$DEV" shell pm grant "$PKG" android.permission.READ_LOGS || echo "READ_LOGS not granted; Home detection stays basic."
+# Lets the launcher show the Wi-Fi network's name (Android 9 hides it from apps otherwise).
+adb -s "$DEV" shell pm grant "$PKG" android.permission.ACCESS_FINE_LOCATION || echo "Location not granted; the Wi-Fi name shows as \"Wi-Fi\"."
 adb -s "$DEV" shell am start -n "$PKG/.MainActivity"
 echo "Installed. Press Home on the remote to test."

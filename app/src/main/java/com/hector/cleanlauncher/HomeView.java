@@ -1,12 +1,11 @@
 package com.hector.cleanlauncher;
 
-import android.content.ComponentName;
+import android.animation.ValueAnimator;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.content.pm.ActivityInfo;
-import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.PorterDuff;
@@ -16,6 +15,10 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
@@ -44,8 +47,6 @@ import java.util.Map;
 
 import static com.hector.cleanlauncher.MainActivity.ADD;
 import static com.hector.cleanlauncher.MainActivity.AppEntry;
-import static com.hector.cleanlauncher.MainActivity.BRANDS;
-import static com.hector.cleanlauncher.MainActivity.BRAND_NAMES;
 import static com.hector.cleanlauncher.MainActivity.DEFAULT_DOCK;
 import static com.hector.cleanlauncher.MainActivity.INK;
 import static com.hector.cleanlauncher.MainActivity.MUTE;
@@ -74,14 +75,30 @@ final class HomeView extends FrameLayout {
     // One decoded wallpaper shared by every HomeView in the process (it is ~8 MB).
     private static Bitmap wallCache;
     private static String wallCacheId;
+    private static Typeface fReg, fMed;
 
     final SharedPreferences prefs;
     private final Host host;
-    private final Typeface fReg, fMed;
+    private final AppCatalog catalog;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    /** What the Home items were last built from; refresh() skips the rebuild if unchanged. */
+    private String builtFor;
+    private int appsVersion = -1;
 
     private final ImageView wall;
+    private final View dim;
+    private Boolean darkApplied;
     private final TextView clock;
+    private final LinearLayout net;
+    private final ImageView netIcon;
+    private final TextView netText;
+    private FrameLayout launching;
+    private boolean netRegistered;
+    private final BroadcastReceiver netChanged = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            updateNetwork();
+        }
+    };
     private final GlassView dock;
     private final HorizontalScrollView shelf;
     private final LinearLayout row, utils, listCol, listUtils;
@@ -95,6 +112,7 @@ final class HomeView extends FrameLayout {
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             updateClock();
+            applyTheme();   // "At night" switches on its own
             handler.postDelayed(this, 5000);
         }
     };
@@ -103,14 +121,23 @@ final class HomeView extends FrameLayout {
         super(c);
         this.host = host;
         prefs = c.getSharedPreferences("home", Context.MODE_PRIVATE);
-        fReg = Typeface.createFromAsset(c.getAssets(), "fonts/Manrope-Regular.ttf");
-        fMed = Typeface.createFromAsset(c.getAssets(), "fonts/Manrope-Medium.ttf");
+        catalog = AppCatalog.get(c);
+        if (fReg == null) {
+            fReg = Typeface.createFromAsset(c.getAssets(), "fonts/Manrope-Regular.ttf");
+            fMed = Typeface.createFromAsset(c.getAssets(), "fonts/Manrope-Medium.ttf");
+        }
         walls = Wallpapers.load(c);
         setBackgroundColor(0xFF1D2A30);
 
         wall = new ImageView(c);
         wall.setScaleType(ImageView.ScaleType.CENTER_CROP);
         addView(wall, new LayoutParams(-1, -1));
+
+        // Dark mode: a black veil over the photo (the glass darkens too, see GlassView.dark).
+        dim = new View(c);
+        dim.setBackgroundColor(0xFF000000);
+        dim.setVisibility(View.GONE);
+        addView(dim, new LayoutParams(-1, -1));
 
         View topShade = new View(c);
         topShade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
@@ -125,6 +152,25 @@ final class HomeView extends FrameLayout {
         lp.leftMargin = dp(56);
         lp.topMargin = dp(36);
         addView(clock, lp);
+
+        // Network name under the clock (follows the clock to the right in the list layout).
+        net = new LinearLayout(c);
+        net.setGravity(Gravity.CENTER_VERTICAL);
+        netIcon = new ImageView(c);
+        netIcon.setAlpha(0.8f);
+        net.addView(netIcon, new LinearLayout.LayoutParams(dp(15), dp(15)));
+        netText = text("", 14, false, MUTE);
+        netText.setSingleLine();
+        netText.setEllipsize(TextUtils.TruncateAt.END);
+        netText.setMaxWidth(dp(260));
+        netText.setShadowLayer(dp(1.5f), 0, dp(0.5f), 0x38000000);
+        LinearLayout.LayoutParams ntp = new LinearLayout.LayoutParams(-2, -2);
+        ntp.setMarginStart(dp(6));
+        net.addView(netText, ntp);
+        lp = new LayoutParams(-2, dp(20));
+        lp.leftMargin = dp(57);
+        lp.topMargin = dp(72);
+        addView(net, lp);
 
         utils = new LinearLayout(c);
         utils.setGravity(Gravity.CENTER_VERTICAL);
@@ -185,11 +231,34 @@ final class HomeView extends FrameLayout {
         lp.bottomMargin = dp(44);
         addView(listUtils, lp);
 
+        applyTheme();
         applyWallpaper(currentWall());
         reloadApps();
         loadDockPrefs();
         buildDock();
         applyHomeLayout();
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        if (!netRegistered) {
+            IntentFilter f = new IntentFilter();
+            f.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
+            f.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+            getContext().registerReceiver(netChanged, f);
+            netRegistered = true;
+        }
+        updateNetwork();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        if (netRegistered) {
+            try { getContext().unregisterReceiver(netChanged); } catch (Exception ignored) { }
+            netRegistered = false;
+        }
+        super.onDetachedFromWindow();
     }
 
     /** ☰ on a Home item opens its menu (the app library handles its own in MainActivity). */
@@ -207,12 +276,48 @@ final class HomeView extends FrameLayout {
 
     /** Re-read everything the activity may have changed: dock, layout, wallpaper, clock. */
     void refresh() {
+        hideLaunching();
         loadDockPrefs();
-        buildDock();
+        syncApps(false);
+        if (!homeKey().equals(builtFor)) buildDock();
         applyHomeLayout();
+        applyTheme();
         applyWallpaper(currentWall());
         updateClock();
+        updateNetwork();
         resetScroll();
+    }
+
+    /** Pick up a changed app list; rebuild the Home items only if something we show changed. */
+    boolean syncApps(boolean rebuild) {
+        if (appsVersion == catalog.version()) return false;
+        reloadApps();
+        if (rebuild) buildDock();
+        return true;
+    }
+
+    /** Everything the Home items depend on. */
+    private String homeKey() {
+        return appsVersion + "|" + TextUtils.join(",", dockPkgs) + "|" + prefs.getInt("show", SHOW_BOTH);
+    }
+
+    /** Feedback while Fire OS holds an app start back (up to ~5 s after Home): "Opening X…". */
+    void showLaunching(String label) {
+        hideLaunching();
+        launching = new FrameLayout(getContext());
+        launching.setBackgroundColor(0x99060A0C);
+        TextView t = text("Opening " + label + "…", 22, true, INK);
+        t.setShadowLayer(dp(2), 0, dp(1), 0x59000000);
+        launching.addView(t, new LayoutParams(-2, -2, Gravity.CENTER));
+        addView(launching, new LayoutParams(-1, -1));
+        launching.setAlpha(0f);
+        launching.animate().alpha(1f).setDuration(120).start();
+    }
+
+    void hideLaunching() {
+        if (launching == null) return;
+        removeView(launching);
+        launching = null;
     }
 
     void startClock() {
@@ -245,38 +350,22 @@ final class HomeView extends FrameLayout {
 
     // ----------------------------------------------------------------- apps
 
+    /** Copy the shared app list (AppCatalog scans; this only takes a snapshot). */
     void reloadApps() {
+        appsVersion = catalog.version();
         apps.clear();
-        Context c = getContext();
-        PackageManager pm = c.getPackageManager();
-        String[] cats = {Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER};
-        for (String cat : cats) {
-            Intent q = new Intent(Intent.ACTION_MAIN).addCategory(cat);
-            for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {
-                ActivityInfo ai = ri.activityInfo;
-                String pkg = ai.packageName;
-                if (pkg.equals(c.getPackageName()) || apps.containsKey(pkg)
-                        || pkg.equals("com.amazon.tv.launcher")
-                        || pkg.equals("com.amazon.firehomestarter")) continue;
-                AppEntry e = new AppEntry();
-                e.pkg = pkg;
-                e.label = String.valueOf(ri.loadLabel(pm));
-                Integer brand = BRANDS.get(pkg);
-                if (brand == null) brand = brandByName(e.label);
-                if (brand != null) {
-                    e.icon = c.getDrawable(brand);
-                    e.brand = true;
-                } else {
-                    e.icon = ri.loadIcon(pm);
-                }
-                e.intent = new Intent(Intent.ACTION_MAIN)
-                        .addCategory(cat)
-                        .setComponent(new ComponentName(pkg, ai.name))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                                | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-                apps.put(pkg, e);
-            }
-        }
+        apps.putAll(catalog.apps());
+    }
+
+    /**
+     * A drawable of its own for each view: the catalog's icons are shared by the activity and
+     * the cover, and one Drawable can't be in two views at once (bounds and callbacks clash).
+     */
+    private Drawable iconFor(AppEntry a) {
+        Drawable d = a.icon;
+        if (d == null) return null;
+        Drawable.ConstantState s = d.getConstantState();
+        return s != null ? s.newDrawable(getResources()) : d;
     }
 
     List<AppEntry> sortedApps() {
@@ -319,18 +408,6 @@ final class HomeView extends FrameLayout {
         return null;
     }
 
-    private Integer brandByName(String label) {
-        String l = label.toLowerCase(Locale.ROOT);
-        if (l.equals("max")) return R.drawable.brand_hbomax;
-        for (String[] b : BRAND_NAMES) {
-            if (l.contains(b[0])) {
-                return getResources().getIdentifier("brand_" + b[1], "drawable",
-                        getContext().getPackageName());
-            }
-        }
-        return null;
-    }
-
     private void saveDock() {
         prefs.edit().putString("dock_v2", TextUtils.join(",", dockPkgs)).apply();
     }
@@ -364,6 +441,7 @@ final class HomeView extends FrameLayout {
             listCol.addView(homeRow(a), new LinearLayout.LayoutParams(-2, dp(68)));
         }
         listCol.addView(homeRow(add), new LinearLayout.LayoutParams(-2, dp(68)));
+        builtFor = homeKey();
 
         if (keep != null) {
             View t = findTile(homeItems(), keep);
@@ -393,6 +471,14 @@ final class HomeView extends FrameLayout {
         cp.leftMargin = l ? 0 : dp(56);
         cp.rightMargin = l ? dp(56) : 0;
         clock.setLayoutParams(cp);
+        LayoutParams np = (LayoutParams) net.getLayoutParams();
+        np.gravity = cp.gravity;
+        np.leftMargin = l ? 0 : dp(57);
+        np.rightMargin = l ? dp(56) : 0;
+        net.setLayoutParams(np);
+        // Icon after the name when right-aligned, so the name lines up under the clock.
+        net.setLayoutDirection(l ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        netText.setTextDirection(View.TEXT_DIRECTION_LTR);
     }
 
     void focusDock(boolean first) {
@@ -453,7 +539,7 @@ final class HomeView extends FrameLayout {
 
         if (showIcon) {
             int size = showName ? 34 : 44;
-            ic.setImageDrawable(a.icon);
+            ic.setImageDrawable(iconFor(a));
             ic.setScaleType(ImageView.ScaleType.FIT_CENTER);
             LayoutParams ip = new LayoutParams(
                     dp(a.brand ? size * 1.7f : size), dp(size),
@@ -510,7 +596,7 @@ final class HomeView extends FrameLayout {
         FrameLayout slot = new FrameLayout(getContext());
         final ImageView ic = new ImageView(getContext());
         ic.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        ic.setImageDrawable(a.icon);
+        ic.setImageDrawable(iconFor(a));
         slot.addView(ic, new LayoutParams(dp(a.brand ? 44 : 32), dp(32), Gravity.CENTER));
         r.addView(slot, new LinearLayout.LayoutParams(dp(56), dp(40)));
 
@@ -518,17 +604,18 @@ final class HomeView extends FrameLayout {
         lb.setSingleLine();
         lb.setEllipsize(TextUtils.TruncateAt.END);
         lb.setLetterSpacing(-0.03f);
-        lb.setShadowLayer(dp(2), 0, dp(1), 0x59000000);
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(-2, -2);
         llp.leftMargin = dp(10);
         r.addView(lb, llp);
 
+        // Dim the label through its colours, not View.setAlpha: a TextView with a shadow and
+        // alpha < 1 is drawn through an offscreen layer every frame, one per row.
         ic.setAlpha(0.78f);
-        lb.setAlpha(0.78f);
+        setTextAlpha(lb, 0.78f);
         r.setOnFocusChangeListener((v, focused) -> {
             float al = focused ? 1f : 0.78f;
             ic.animate().alpha(al).setDuration(160).start();
-            lb.animate().alpha(al).setDuration(160).start();
+            fadeText(lb, al);
             if (focused) {
                 lastDockPkg = a.pkg;
                 centerInList(r);
@@ -560,6 +647,28 @@ final class HomeView extends FrameLayout {
             return true;
         });
         return r;
+    }
+
+    /** Text and shadow at the given opacity, keeping the view itself opaque. */
+    private void setTextAlpha(TextView t, float a) {
+        t.setTag(R.id.text_alpha, a);
+        t.setTextColor(withAlpha(INK, a));
+        t.setShadowLayer(dp(2), 0, dp(1), withAlpha(0x59000000, a));
+    }
+
+    private void fadeText(final TextView t, float to) {
+        Object tag = t.getTag(R.id.text_alpha);
+        float from = tag instanceof Float ? (Float) tag : 1f;
+        Object old = t.getTag(R.id.text_anim);
+        if (old instanceof ValueAnimator) ((ValueAnimator) old).cancel();
+        ValueAnimator va = ValueAnimator.ofFloat(from, to).setDuration(160);
+        va.addUpdateListener(an -> setTextAlpha(t, (Float) an.getAnimatedValue()));
+        t.setTag(R.id.text_anim, va);
+        va.start();
+    }
+
+    private static int withAlpha(int color, float a) {
+        return (Math.round((color >>> 24) * a) << 24) | (color & 0xFFFFFF);
     }
 
     /** Smoothly scroll the Home list so the focused row sits mid-screen (clamped at the ends). */
@@ -618,7 +727,7 @@ final class HomeView extends FrameLayout {
         FrameLayout slot = new FrameLayout(getContext());
         final ImageView ic = new ImageView(getContext());
         ic.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        ic.setImageDrawable(a.icon);
+        ic.setImageDrawable(iconFor(a));
         slot.addView(ic, new LayoutParams(dp(a.brand ? 44 : 32), dp(32), Gravity.CENTER));
         r.addView(slot, new LinearLayout.LayoutParams(dp(48), dp(40)));
 
@@ -776,6 +885,81 @@ final class HomeView extends FrameLayout {
     void updateClock() {
         boolean c24 = prefs.getBoolean("clock24", false);
         clock.setText(new SimpleDateFormat(c24 ? "H:mm" : "h:mm", Locale.getDefault()).format(new Date()));
+    }
+
+    static final String PREF_DARK = "dark";
+    static final String DARK_OFF = "off", DARK_ON = "on", DARK_NIGHT = "night";
+
+    /** Dark mode now: always, never, or 7 PM to 7 AM. */
+    static boolean isDark(SharedPreferences prefs) {
+        String m = prefs.getString(PREF_DARK, DARK_OFF);
+        if (DARK_ON.equals(m)) return true;
+        if (!DARK_NIGHT.equals(m)) return false;
+        int h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+        return h >= 19 || h < 7;
+    }
+
+    /** Dim the photo and darken the glass in dark mode; no-op if nothing changed. */
+    void applyTheme() {
+        boolean d = isDark(prefs);
+        if (darkApplied != null && darkApplied == d && GlassView.dark == d) return;
+        darkApplied = d;
+        GlassView.dark = d;
+        dim.setAlpha(0.5f);
+        dim.setVisibility(d ? View.VISIBLE : View.GONE);
+        invalidateGlass(getRootView());
+    }
+
+    static final String PREF_SHOW_NET = "showWifi";
+
+    /** Network row under the clock: Wi-Fi name and signal, Ethernet, or not connected. */
+    void updateNetwork() {
+        if (!prefs.getBoolean(PREF_SHOW_NET, true)) {
+            net.setVisibility(View.GONE);
+            return;
+        }
+        int icon;
+        String label;
+        NetworkInfo ni = null;
+        try {
+            ConnectivityManager cm = (ConnectivityManager)
+                    getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+            ni = cm.getActiveNetworkInfo();
+        } catch (Exception ignored) { }
+        if (ni == null || !ni.isConnected()) {
+            icon = R.drawable.ic_wifi_off;
+            label = "Not connected";
+        } else if (ni.getType() == ConnectivityManager.TYPE_ETHERNET) {
+            icon = R.drawable.ic_ethernet;
+            label = "Ethernet";
+        } else if (ni.getType() == ConnectivityManager.TYPE_WIFI) {
+            WifiInfo wi = null;
+            try {
+                WifiManager wm = (WifiManager)
+                        getContext().getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                wi = wm.getConnectionInfo();
+            } catch (Exception ignored) { }
+            int level = wi != null ? WifiManager.calculateSignalLevel(wi.getRssi(), 3) : 2;
+            icon = level >= 2 ? R.drawable.ic_wifi_3 : level == 1 ? R.drawable.ic_wifi_2 : R.drawable.ic_wifi_1;
+            String ssid = ssid(wi);
+            // Android 9 hides the name unless we hold the location permission (install.sh
+            // grants it, or Settings › Wi-Fi network asks for it).
+            label = ssid != null ? ssid : "Wi-Fi";
+        } else {
+            icon = R.drawable.ic_wifi_3;
+            label = "Connected";
+        }
+        netIcon.setImageResource(icon);
+        netText.setText(label);
+        net.setVisibility(View.VISIBLE);
+    }
+
+    static String ssid(WifiInfo wi) {
+        if (wi == null) return null;
+        String s = wi.getSSID();
+        if (s == null || s.isEmpty() || s.equals("<unknown ssid>") || s.equals("0x")) return null;
+        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) s = s.substring(1, s.length() - 1);
+        return s.isEmpty() ? null : s;
     }
 
     TextView text(String s, float sp, boolean medium, int color) {

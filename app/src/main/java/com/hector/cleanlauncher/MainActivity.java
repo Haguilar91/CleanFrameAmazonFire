@@ -2,10 +2,8 @@ package com.hector.cleanlauncher;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Outline;
 import android.graphics.drawable.ColorDrawable;
@@ -110,12 +108,10 @@ public class MainActivity extends Activity implements HomeView.Host {
     private boolean pickingForHome;
     private TextView pickerName, pickerCredit;
 
-    private final BroadcastReceiver packages = new BroadcastReceiver() {
-        @Override public void onReceive(Context c, Intent i) {
-            hv.reloadApps();
-            hv.buildDock();
-            if (libraryGrid != null) fillLibrary(null);
-        }
+    private boolean resumed;
+    /** The shared app list changed: rebuild now if we're showing, else on the next resume. */
+    private final Runnable appsChanged = () -> {
+        if (resumed) syncApps();
     };
 
     // ------------------------------------------------------------ lifecycle
@@ -131,12 +127,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         root.addView(hv, new FrameLayout.LayoutParams(-1, -1));
         hv.focusDock(true);
 
-        IntentFilter f = new IntentFilter();
-        f.addAction(Intent.ACTION_PACKAGE_ADDED);
-        f.addAction(Intent.ACTION_PACKAGE_REMOVED);
-        f.addAction(Intent.ACTION_PACKAGE_CHANGED);
-        f.addDataScheme("package");
-        registerReceiver(packages, f);
+        AppCatalog.get(this).addListener(appsChanged);
 
         handleOpen(getIntent());
     }
@@ -144,7 +135,10 @@ public class MainActivity extends Activity implements HomeView.Host {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         HomeWatcherService.onLauncherResumed();
+        syncApps();
+        hv.updateNetwork();
         // Pick up where the cover left off, then take it down.
         String focus = HomeWatcherService.coverFocus();
         if (focus != null && overlay == null) {
@@ -166,13 +160,20 @@ public class MainActivity extends Activity implements HomeView.Host {
     @Override
     protected void onPause() {
         super.onPause();
+        resumed = false;
         hv.stopClock();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        unregisterReceiver(packages);
+        AppCatalog.get(this).removeListener(appsChanged);
+    }
+
+    private void syncApps() {
+        if (!hv.syncApps(true) || libraryGrid == null) return;
+        View f = getCurrentFocus();
+        fillLibrary(f != null && f.getTag() instanceof AppEntry ? ((AppEntry) f.getTag()).pkg : null);
     }
 
     @Override
@@ -427,6 +428,21 @@ public class MainActivity extends Activity implements HomeView.Host {
             ((TextView) v.findViewWithTag("value")).setText(c24 ? "24-hour" : "12-hour");
             hv.updateClock();
         }));
+        final String[] darkModes = {HomeView.DARK_OFF, HomeView.DARK_ON, HomeView.DARK_NIGHT};
+        final String[] darkNames = {"Off", "On", "At night (7 PM–7 AM)"};
+        list.addView(settingRow("Dark mode", darkNames[darkIndex(darkModes)], v -> {
+            int next = (darkIndex(darkModes) + 1) % darkModes.length;
+            prefs.edit().putString(HomeView.PREF_DARK, darkModes[next]).apply();
+            ((TextView) v.findViewWithTag("value")).setText(darkNames[next]);
+            hv.applyTheme();
+        }));
+        list.addView(settingRow("Wi-Fi network", netSettingValue(), v -> {
+            boolean show = !prefs.getBoolean(HomeView.PREF_SHOW_NET, true);
+            prefs.edit().putBoolean(HomeView.PREF_SHOW_NET, show).apply();
+            if (show && !canReadWifiName()) askForWifiName();
+            ((TextView) v.findViewWithTag("value")).setText(netSettingValue());
+            hv.updateNetwork();
+        }));
         list.addView(settingRow("Apps layout", libraryAsList() ? "List" : "Grid", v -> {
             boolean asList = !libraryAsList();
             prefs.edit().putBoolean("libList", asList).apply();
@@ -490,6 +506,33 @@ public class MainActivity extends Activity implements HomeView.Host {
         o.addView(credit, cp);
 
         list.getChildAt(0).requestFocus();
+    }
+
+    private int darkIndex(String[] modes) {
+        String m = prefs.getString(HomeView.PREF_DARK, HomeView.DARK_OFF);
+        for (int i = 0; i < modes.length; i++) if (modes[i].equals(m)) return i;
+        return 0;
+    }
+
+    private String netSettingValue() {
+        return prefs.getBoolean(HomeView.PREF_SHOW_NET, true) ? "Shown" : "Hidden";
+    }
+
+    /** Android 9 only reveals the Wi-Fi name to apps holding the location permission. */
+    private boolean canReadWifiName() {
+        return checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void askForWifiName() {
+        try {
+            requestPermissions(new String[]{android.Manifest.permission.ACCESS_FINE_LOCATION}, 1);
+        } catch (Exception ignored) { }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        hv.updateNetwork();
     }
 
     /** Show Amazon's home and stay there until Home is pressed again or an app is opened. */

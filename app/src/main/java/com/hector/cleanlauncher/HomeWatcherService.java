@@ -1,16 +1,16 @@
 package com.hector.cleanlauncher;
 
 import android.accessibilityservice.AccessibilityService;
-import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.PixelFormat;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
@@ -20,6 +20,14 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import static com.hector.cleanlauncher.MainActivity.ADD;
 import static com.hector.cleanlauncher.MainActivity.AppEntry;
@@ -41,6 +49,12 @@ import static com.hector.cleanlauncher.MainActivity.OPEN_WALLPAPERS;
  *
  * HomeKeyWatcher, when READ_LOGS has been granted, reports Home presses earlier and also those
  * made while Amazon's home is already in front, which change no window.
+ *
+ * The cover is an overlay, so it doesn't pause the app beneath it: if it were ever left up
+ * over a playing app, the screen would show the cover (or, before it draws, nothing) while the
+ * app kept playing sound. So while it is up we check which app window is really in front
+ * (getWindows) and take the cover down as soon as that isn't Amazon's home, and it never
+ * outlives MAX_COVER_MS.
  */
 public class HomeWatcherService extends AccessibilityService implements HomeView.Host {
 
@@ -69,6 +83,10 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     /** Amazon's home can report one press as two window changes. */
     private static final long DEBOUNCE_MS = 350;
     private static final long DOUBLE_PRESS_MS = 1500;
+    /** While covering, check the front app this often; first check after Amazon's home is up. */
+    private static final long WATCH_FIRST_MS = 1200, WATCH_MS = 1000;
+    /** No cover outlives this unless an app pick is pending (that has PICK_TIMEOUT_MS). */
+    private static final long MAX_COVER_MS = 20000;
 
     private static HomeWatcherService instance;
     /** Set by "Open Amazon home": leave Amazon's home alone until Home is pressed or an app opens. */
@@ -81,7 +99,12 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     private boolean coverUp, picked, keyWatchBound;
     private String pendingOpen;
     private int retriesLeft;
-    private long lastShowAt, lastHomeKeyAt;
+    private long lastShowAt, lastHomeKeyAt, coverSince;
+    /** Bumped each time the cover goes up, so stale window checks are ignored. */
+    private int coverGen;
+    /** getWindows() can wait on other apps, so it runs off the main thread. */
+    private Handler checker;
+    private final Map<String, Boolean> activityClasses = new HashMap<>();
 
     private final Runnable handoff = new Runnable() {
         @Override public void run() {
@@ -90,13 +113,8 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             if (retriesLeft-- > 0) handler.postDelayed(this, RETRY_MS);
         }
     };
-    private final Runnable uncover = this::removeCover;
-
-    private final BroadcastReceiver packages = new BroadcastReceiver() {
-        @Override public void onReceive(Context c, Intent i) {
-            if (cover != null && !coverUp) cover.reloadApps();
-        }
-    };
+    private final Runnable uncover = () -> removeCover("app in front");
+    private final Runnable watch = this::checkFront;
 
     // ------------------------------------------------------- MainActivity API
 
@@ -136,7 +154,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
     static void hideCover() {
         HomeWatcherService s = instance;
-        if (s != null) s.removeCover();
+        if (s != null) s.removeCover("launcher resumed");
     }
 
     /** Start Amazon's home without the HOME category, and don't redirect away from it. */
@@ -170,19 +188,16 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         } catch (Exception e) {
             Log.w(TAG, "couldn't build the cover: " + e);
         }
-        IntentFilter f = new IntentFilter();
-        f.addAction(Intent.ACTION_PACKAGE_ADDED);
-        f.addAction(Intent.ACTION_PACKAGE_REMOVED);
-        f.addAction(Intent.ACTION_PACKAGE_CHANGED);
-        f.addDataScheme("package");
-        registerReceiver(packages, f);
+        HandlerThread t = new HandlerThread("windows");
+        t.start();
+        checker = new Handler(t.getLooper());
         bindKeyWatcher();
     }
 
     @Override
     public void onDestroy() {
-        removeCover();
-        try { unregisterReceiver(packages); } catch (Exception ignored) { }
+        removeCover("service stopped");
+        if (checker != null) checker.getLooper().quitSafely();
         if (keyWatchBound) {
             try { unbindService(keyWatch); } catch (Exception ignored) { }
             keyWatchBound = false;
@@ -221,11 +236,10 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             }
         }
 
-        boolean isHome = contains(KNOWN_HOMES, pkg) || pkg.equals(prefs.getString("homePkg", ""));
-        if (!isHome) {
+        if (!isHome(pkg, prefs)) {
             if (contains(NOT_HOMES, pkg)) return;
             // Another app is in front: it's what was picked, or the user moved on.
-            if (cover != null && cover.apps.containsKey(pkg)) stayOnAmazon = false;
+            if (AppCatalog.get(this).apps().containsKey(pkg)) stayOnAmazon = false;
             if (coverUp) {
                 handler.removeCallbacks(uncover);
                 handler.postDelayed(uncover, REVEAL_MS);
@@ -235,8 +249,45 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
         if (stayOnAmazon || MODE_AMAZON.equals(mode(prefs))) return;
         if (now - lastShowAt < DEBOUNCE_MS) return;
-        lastShowAt = now;
-        showCover();
+        if (isActivity(pkg, e.getClassName())) {
+            lastShowAt = now;
+            showCover();
+        } else {
+            // A popup or a view inside Amazon's home, not its home screen arriving: it can
+            // happen while another app is in front. Cover only if the home really is in front.
+            final String cls = String.valueOf(e.getClassName());
+            frontApp(top -> {
+                if (top != null && isHome(top, getSharedPreferences("home", MODE_PRIVATE))
+                        && !coverUp && !stayOnAmazon) {
+                    Log.i(TAG, "home in front after " + cls);
+                    lastShowAt = SystemClock.uptimeMillis();
+                    showCover();
+                }
+            });
+        }
+    }
+
+    private boolean isHome(String pkg, SharedPreferences prefs) {
+        return contains(KNOWN_HOMES, pkg) || pkg.equals(prefs.getString("homePkg", ""));
+    }
+
+    /** Whether a window-state event names an activity (a screen), not a dialog or view. */
+    private boolean isActivity(String pkg, CharSequence cls) {
+        if (cls == null) return true;
+        String key = pkg + "/" + cls;
+        Boolean known = activityClasses.get(key);
+        if (known == null) {
+            try {
+                getPackageManager().getActivityInfo(new ComponentName(pkg, cls.toString()), 0);
+                known = true;
+            } catch (PackageManager.NameNotFoundException e) {
+                known = false;
+            } catch (Exception e) {
+                known = true;
+            }
+            activityClasses.put(key, known);
+        }
+        return known;
     }
 
     /** From HomeKeyWatcher: the system started the HOME intent, i.e. Home was pressed. */
@@ -250,7 +301,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         if (MODE_AMAZON.equals(mode)) return;
         if (MODE_TWICE.equals(mode) && second && coverUp) {
             stayOnAmazon = true;               // second press: show Amazon's home
-            removeCover();
+            removeCover("second Home press");
             return;
         }
         stayOnAmazon = false;
@@ -274,15 +325,20 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             // Home again while covering: Fire OS restarts its hold, so restart ours.
             if (picked) return;
             cover.focusDock(true);
+            coverSince = SystemClock.uptimeMillis();
             restartHandoff();
             return;
         }
         cover.refresh();
+        // Focusable, so it takes the D-pad. Not touchable (a TV has no touch), which also
+        // keeps the windows beneath it visible to getWindows(). Translucent, so if it is ever
+        // up before it has drawn, Amazon's home shows through instead of a black screen.
         coverLp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,   // focusable: takes the D-pad
-                PixelFormat.OPAQUE);
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT);
         try {
             wm.addView(cover, coverLp);
         } catch (Exception e) {
@@ -291,11 +347,93 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             return;
         }
         coverUp = true;
+        coverGen++;
+        coverSince = SystemClock.uptimeMillis();
         picked = false;
         pendingOpen = null;
         cover.startClock();
         cover.focusDock(true);
         restartHandoff();
+        handler.removeCallbacks(watch);
+        handler.postDelayed(watch, WATCH_FIRST_MS);
+        Log.i(TAG, "cover up");
+    }
+
+    // ------------------------------------------------------------ front app check
+
+    interface FrontApp { void on(String pkg); }
+
+    /** Looks up the front app off the main thread and reports back on it (null if unknown). */
+    private void frontApp(final FrontApp cb) {
+        if (checker == null) {
+            cb.on(null);
+            return;
+        }
+        checker.post(() -> {
+            final String top = topAppPackage();
+            handler.post(() -> cb.on(top));
+        });
+    }
+
+    /** While covering: is Amazon's home (still) the app in front? If not, uncover. */
+    private void checkFront() {
+        if (!coverUp) return;
+        final int gen = coverGen;
+        frontApp(top -> {
+            if (!coverUp || gen != coverGen) return;
+            Log.i(TAG, "front app under the cover: " + top);
+            SharedPreferences prefs = getSharedPreferences("home", MODE_PRIVATE);
+            if (top != null && !isHome(top, prefs)) {
+                if (picked) {
+                    handler.removeCallbacks(uncover);
+                    handler.postDelayed(uncover, REVEAL_MS);   // let the picked app draw first
+                } else {
+                    removeCover(top + " is in front");
+                }
+                return;
+            }
+            if (!picked && SystemClock.uptimeMillis() - coverSince > MAX_COVER_MS) {
+                removeCover("launcher didn't take over in time");
+                return;
+            }
+            handler.postDelayed(watch, WATCH_MS);
+        });
+    }
+
+    /**
+     * The package of the topmost app window, skipping ours and system overlays, or null if
+     * the system won't say. Runs on the checker thread.
+     */
+    private String topAppPackage() {
+        List<AccessibilityWindowInfo> all;
+        try {
+            all = getWindows();
+        } catch (Exception e) {
+            return null;
+        }
+        if (all == null || all.isEmpty()) return null;
+        List<AccessibilityWindowInfo> apps = new ArrayList<>();
+        for (AccessibilityWindowInfo w : all) {
+            if (w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) apps.add(w);
+        }
+        Collections.sort(apps, (a, b) -> b.getLayer() - a.getLayer());
+        String found = null;
+        for (AccessibilityWindowInfo w : apps) {
+            AccessibilityNodeInfo root = null;
+            try {
+                root = w.getRoot();
+            } catch (Exception ignored) { }
+            if (root == null) continue;
+            CharSequence p = root.getPackageName();
+            root.recycle();
+            if (p == null) continue;
+            String pkg = p.toString();
+            if (pkg.equals(getPackageName()) || contains(NOT_HOMES, pkg)) continue;
+            found = pkg;
+            break;
+        }
+        for (AccessibilityWindowInfo w : all) w.recycle();
+        return found;
     }
 
     private void restartHandoff() {
@@ -304,16 +442,19 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         handler.postDelayed(handoff, HANDOFF_MS);
     }
 
-    private void removeCover() {
+    private void removeCover(String why) {
         handler.removeCallbacks(handoff);
         handler.removeCallbacks(uncover);
+        handler.removeCallbacks(watch);
         if (!coverUp) return;
         try {
             wm.removeView(cover);
         } catch (Exception e) {
             Log.w(TAG, "couldn't remove the cover: " + e);
         }
+        Log.i(TAG, "cover down: " + why);
         cover.stopClock();
+        cover.hideLaunching();
         coverUp = false;
         picked = false;
         pendingOpen = null;
@@ -353,6 +494,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         picked = true;
         handler.removeCallbacks(handoff);
         setCoverFocusable(false);
+        cover.showLaunching(a.label);
         try {
             startActivity(a.intent);
         } catch (Exception e) {

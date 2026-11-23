@@ -7,7 +7,7 @@ launcher), rebuilt as a native Android app in plain Java with no AndroidX.
 
 - Package: `com.hector.cleanlauncher`
 - Device: Fire OS 7 (Android 9, API 28), reached over Wi-Fi ADB at
-  **192.168.50.231:5555**
+  **192.168.1.126:5555** (was 192.168.50.231 on the old network)
 - The user is on a **Mac**; `adb` is installed via Homebrew
   (`android-platform-tools`).
 
@@ -39,9 +39,12 @@ launcher), rebuilt as a native Android app in plain Java with no AndroidX.
 - `install.sh`: `adb install -r`, then enables the service with
   `settings put secure enabled_accessibility_services ...` and
   `accessibility_enabled 1`.
-- `build-local.sh`: a Linux-only build with no Gradle, which made the included
-  `CleanLauncher.apk`. Its `/tmp/tools` paths **won't exist on the Mac**.
-  Signed with `debug.keystore`.
+- `build-local.sh`: a Gradle-free build (aapt2/javac/d8/apksigner) that makes
+  `CleanLauncher.apk`. Works on the Mac with Homebrew `android-commandlinetools`
+  and `openjdk@17` (falls back to the old Linux `/tmp/tools` paths). Signed with
+  `debug.keystore`. Homebrew's Gradle 9 is too new for AGP 8.2.2, so prefer this.
+- `AppCatalog.java`: the app list, scanned once per process in the background and
+  shared by MainActivity and the cover; screens rebuild only when it changes.
 
 ## Current problem (start here)
 **Pressing Home still opens Amazon's UI instead of Clean Launcher**, after a

@@ -50,6 +50,13 @@ public class GlassView extends FrameLayout {
         edge.setColor(0x1FFFFFFF);
     }
 
+    /** Forget the cached shader so the old blur bitmap can be garbage collected. */
+    void clearShader() {
+        shader = null;
+        shaderFor = null;
+        shaderPaint.setShader(null);
+    }
+
     public void setVeil(int dark, int light) {
         veilDark = dark;
         veilLight = light;
@@ -76,6 +83,7 @@ public class GlassView extends FrameLayout {
             shaderPaint.setShader(shader);
             c.drawRoundRect(rect, radius, radius, shaderPaint);
         } else {
+            clearShader();
             fill.setColor(0xFF1D2A30);
             c.drawRoundRect(rect, radius, radius, fill);
         }

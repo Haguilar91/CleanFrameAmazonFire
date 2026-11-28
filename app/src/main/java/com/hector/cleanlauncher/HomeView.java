@@ -69,12 +69,10 @@ final class HomeView extends FrameLayout {
         void openLibrary();
         void openSettings();
         void openWallpapers();
+        void openTasks();
         void showMenu(AppEntry a, boolean inDock);
     }
 
-    // One decoded wallpaper shared by every HomeView in the process (it is ~8 MB).
-    private static Bitmap wallCache;
-    private static String wallCacheId;
     private static Typeface fReg, fMed;
 
     final SharedPreferences prefs;
@@ -118,7 +116,13 @@ final class HomeView extends FrameLayout {
     };
 
     HomeView(Context c, Host host) {
+        this(c, host, false);
+    }
+
+    /** asyncWall: never decode the wallpaper on the calling thread (the cover). */
+    HomeView(Context c, Host host, boolean asyncWall) {
         super(c);
+        this.asyncWall = asyncWall;
         this.host = host;
         prefs = c.getSharedPreferences("home", Context.MODE_PRIVATE);
         catalog = AppCatalog.get(c);
@@ -176,6 +180,7 @@ final class HomeView extends FrameLayout {
         utils.setGravity(Gravity.CENTER_VERTICAL);
         utils.addView(util(R.drawable.ic_wallpaper, "Wallpaper", v -> host.openWallpapers()));
         utils.addView(util(R.drawable.ic_apps, "Apps", v -> host.openLibrary()));
+        utils.addView(util(R.drawable.ic_memory, "Tasks", v -> host.openTasks()));
         utils.addView(util(R.drawable.ic_settings, "Settings", v -> host.openSettings()));
         lp = new LayoutParams(-2, dp(32), Gravity.TOP | Gravity.END);
         lp.rightMargin = dp(52);
@@ -225,6 +230,7 @@ final class HomeView extends FrameLayout {
         listUtils.setOrientation(LinearLayout.VERTICAL);
         listUtils.setGravity(Gravity.END);
         listUtils.addView(listUtil(R.drawable.ic_apps, "All apps", v -> host.openLibrary()));
+        listUtils.addView(listUtil(R.drawable.ic_memory, "Tasks", v -> host.openTasks()));
         listUtils.addView(listUtil(R.drawable.ic_settings, "Settings", v -> host.openSettings()));
         lp = new LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.END);
         lp.rightMargin = dp(48);
@@ -232,7 +238,7 @@ final class HomeView extends FrameLayout {
         addView(listUtils, lp);
 
         applyTheme();
-        applyWallpaper(currentWall());
+        if (!asyncWall) applyWallpaper(currentWall());   // the cover gets its wallpaper in refresh()
         reloadApps();
         loadDockPrefs();
         buildDock();
@@ -361,7 +367,7 @@ final class HomeView extends FrameLayout {
      * A drawable of its own for each view: the catalog's icons are shared by the activity and
      * the cover, and one Drawable can't be in two views at once (bounds and callbacks clash).
      */
-    private Drawable iconFor(AppEntry a) {
+    Drawable iconFor(AppEntry a) {
         Drawable d = a.icon;
         if (d == null) return null;
         Drawable.ConstantState s = d.getConstantState();
@@ -847,36 +853,75 @@ final class HomeView extends FrameLayout {
         return walls.isEmpty() ? null : walls.get(0);
     }
 
+    private boolean holdingBitmaps;
+    /** The cover decodes off the main thread: solid colour first, then the photo. */
+    final boolean asyncWall;
+    private String wantedWall;
+
     void applyWallpaper(Wallpapers.Item w) {
         if (w == null) return;
-        if (!w.id.equals(wallCacheId)) {
-            wallCache = decode("wallpapers/" + w.id + ".jpg", 1);
-            wallCacheId = w.id;
-            GlassView.blur = decode("materials/" + w.id + "-blur.jpg", 2);
-            GlassView.lightTone = w.light;
+        if (!holdingBitmaps) {
+            holdingBitmaps = true;
+            Bitmaps.hold();
         }
-        wall.setImageBitmap(wallCache);
+        GlassView.lightTone = w.light;
+        wantedWall = w.id;
+        final String id = w.id;
+        if (!Bitmaps.cached(id)) {
+            // A different (or released) wallpaper: drop the old one from the views BEFORE decoding.
+            wall.setImageDrawable(null);
+            GlassView.blur = null;
+            invalidateGlass(getRootView());
+        }
+        if (asyncWall && !Bitmaps.cached(id)) {
+            final Context c = getContext().getApplicationContext();
+            new Thread(() -> {
+                final Bitmap[] r = Bitmaps.get(c, id);
+                handler.post(() -> {
+                    if (!holdingBitmaps || !id.equals(wantedWall) || r[0] == null) return;
+                    GlassView.blur = r[1];
+                    wall.setImageBitmap(r[0]);
+                    invalidateGlass(getRootView());
+                });
+            }, "wallpaper").start();
+            return;
+        }
+        Bitmap[] r = Bitmaps.get(getContext(), id);
+        GlassView.blur = r[1];
+        wall.setImageBitmap(r[0]);   // null (decode failed) leaves the solid background colour
         invalidateGlass(getRootView());
     }
 
-    private void invalidateGlass(View v) {
-        if (v instanceof GlassView) v.invalidate();
+    /** Let go of the big bitmaps while hidden; refresh()/applyWallpaper() brings them back. */
+    void releaseBitmaps() {
+        wall.setImageDrawable(null);
+        if (holdingBitmaps) {
+            holdingBitmaps = false;
+            Bitmaps.release();
+        }
+        if (!Bitmaps.inUse()) GlassView.blur = null;
+        // onDraw doesn't run while hidden, so clear every glass panel's cached shader here.
+        clearGlass(this);
+        View rootView = getRootView();
+        if (rootView != this) clearGlass(rootView);   // panels in the activity's root
+    }
+
+    private void clearGlass(View v) {
+        if (v instanceof GlassView) ((GlassView) v).clearShader();
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) invalidateGlass(g.getChildAt(i));
+            for (int i = 0; i < g.getChildCount(); i++) clearGlass(g.getChildAt(i));
         }
     }
 
-    Bitmap decode(String asset, int sample) {
-        try {
-            InputStream in = getContext().getAssets().open(asset);
-            BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inSampleSize = sample;
-            Bitmap b = BitmapFactory.decodeStream(in, null, o);
-            in.close();
-            return b;
-        } catch (Exception e) {
-            return null;
+    private void invalidateGlass(View v) {
+        if (v instanceof GlassView) {
+            if (GlassView.blur == null) ((GlassView) v).clearShader();
+            v.invalidate();
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) invalidateGlass(g.getChildAt(i));
         }
     }
 

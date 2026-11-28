@@ -1,5 +1,6 @@
 package com.hector.cleanlauncher;
 
+import android.app.ActivityManager;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -8,6 +9,9 @@ import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -88,6 +92,47 @@ final class AppCatalog {
         }, f);
     }
 
+    /** Never listed or killed: Amazon, system and Android packages (and us). */
+    static boolean isProtected(Context c, String p) {
+        return p.equals(c.getPackageName()) || p.equals("android")
+                || p.startsWith("com.amazon.") || p.startsWith("amazon.")
+                || p.startsWith("com.android.");
+    }
+
+    /**
+     * Ask Android to drop the cached background processes of the other launchable apps, so the
+     * app being opened has the memory. killBackgroundProcesses only touches processes that are
+     * already in the background (never the one in front), so it is safe. Protected packages
+     * are never targeted. Runs on the apps thread.
+     */
+    void freeMemory(final String keep, final String why) {
+        if (!ctx.getSharedPreferences("home", Context.MODE_PRIVATE).getBoolean("freeMem", true)) return;
+        final List<String> pkgs = new ArrayList<>(apps.keySet());
+        bg.post(() -> killAll(ctx, pkgs, keep, why));
+    }
+
+    /** Synchronous: the caller picks the thread. Returns how many packages were targeted. */
+    static int killAll(Context ctx, List<String> pkgs, String keep, String why) {
+        ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+        if (am == null) return 0;
+        int n = 0;
+        for (String p : pkgs) {
+            if (p.equals(keep) || isProtected(ctx, p)) continue;
+            try {
+                am.killBackgroundProcesses(p);
+                n++;
+            } catch (Exception e) {
+                // no permission or gone: nothing to free
+            }
+        }
+        Log.d(TAG, "killBackgroundProcesses for " + n + " apps (" + why + ", keeping " + keep + ")");
+        return n;
+    }
+
+    List<String> packages() {
+        return new ArrayList<>(apps.keySet());
+    }
+
     /** Current apps by package. Treat as read-only. */
     Map<String, AppEntry> apps() {
         return apps;
@@ -158,6 +203,7 @@ final class AppCatalog {
                         icon = null;
                     }
                 }
+                if (icon != null && brand == null && !icons.containsKey(key)) icon = shrink(icon);
                 if (icon != null) keep.put(key, icon);
                 e.icon = icon;
                 e.brand = brand != null;
@@ -178,6 +224,30 @@ final class AppCatalog {
         s.signature = TextUtils.join("\n", sig);
         Log.d(TAG, "scanned " + found.size() + " apps in " + (System.currentTimeMillis() - t0) + " ms");
         return s;
+    }
+
+    private static final int ICON_MAX = 128;
+
+    /** Render a big icon once into a bitmap of at most 128 px (aspect kept) and drop the original. */
+    private Drawable shrink(Drawable d) {
+        int w = d.getIntrinsicWidth(), h = d.getIntrinsicHeight();
+        if (w > 0 && h > 0 && w <= ICON_MAX && h <= ICON_MAX) return d;
+        try {
+            if (w <= 0 || h <= 0) {
+                w = h = ICON_MAX;
+            } else {
+                float k = ICON_MAX / (float) Math.max(w, h);
+                w = Math.max(1, Math.round(w * k));
+                h = Math.max(1, Math.round(h * k));
+            }
+            Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            d.setBounds(0, 0, w, h);
+            d.draw(new Canvas(b));
+            return new BitmapDrawable(ctx.getResources(), b);
+        } catch (Throwable e) {   // OutOfMemoryError included: keep the original
+            Log.w(TAG, "couldn't shrink an icon: " + e);
+            return d;
+        }
     }
 
     /** Changes when the app is updated (new install path) or its icon resource changes. */

@@ -35,6 +35,7 @@ import static com.hector.cleanlauncher.MainActivity.EXTRA_OPEN;
 import static com.hector.cleanlauncher.MainActivity.OPEN_LIBRARY;
 import static com.hector.cleanlauncher.MainActivity.OPEN_MENU;
 import static com.hector.cleanlauncher.MainActivity.OPEN_SETTINGS;
+import static com.hector.cleanlauncher.MainActivity.OPEN_TASKS;
 import static com.hector.cleanlauncher.MainActivity.OPEN_WALLPAPERS;
 
 /**
@@ -184,7 +185,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         try {
-            cover = new HomeView(this, this);
+            cover = new HomeView(this, this, true);   // wallpaper loads in refresh(), off-thread
         } catch (Exception e) {
             Log.w(TAG, "couldn't build the cover: " + e);
         }
@@ -192,10 +193,59 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         t.start();
         checker = new Handler(t.getLooper());
         bindKeyWatcher();
+        handler.postDelayed(memCheck, MEM_CHECK_MS);
+    }
+
+    // ------------------------------------------------------- low-memory watchdog
+
+    private static final long MEM_CHECK_MS = 30000, MEM_KILL_GAP_MS = 60000;
+    private static final long MEM_LOW_BYTES = 350L * 1024 * 1024;
+    private long lastMemKillAt;
+    private final Runnable memCheck = new Runnable() {
+        @Override public void run() {
+            handler.postDelayed(this, MEM_CHECK_MS);   // plain Handler: no wakelock
+            watchMemory();
+        }
+    };
+
+    /**
+     * Cached apps piling up behind a heavy one is what wedged the stick: when memory is low,
+     * drop the background processes of every launchable app except the one in front.
+     */
+    private void watchMemory() {
+        if (!getSharedPreferences("home", MODE_PRIVATE).getBoolean("freeMem", true)) return;
+        long now = SystemClock.uptimeMillis();
+        if (lastMemKillAt != 0 && now - lastMemKillAt < MEM_KILL_GAP_MS) return;
+        android.app.ActivityManager.MemoryInfo mi = Tasks.memory(this);
+        if (!mi.lowMemory && mi.availMem >= MEM_LOW_BYTES) return;
+        if (checker == null) return;
+        final long availMb = mi.availMem / (1024 * 1024);
+        final boolean low = mi.lowMemory;
+        lastMemKillAt = now;
+        final List<String> pkgs = AppCatalog.get(this).packages();
+        checker.post(() -> {
+            String top = topAppPackage();
+            if (top == null) {
+                Log.d(TAG, "low memory (" + availMb + " MB free) but front app unknown, not killing");
+                return;
+            }
+            Log.d(TAG, "low memory (" + availMb + " MB free, lowMemory=" + low + "), front app " + top);
+            AppCatalog.killAll(this, pkgs, top, "watchdog");
+        });
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_UI_HIDDEN && !coverUp && cover != null) {
+            Log.d(TAG, "onTrimMemory " + level + ": releasing cover bitmaps");
+            cover.releaseBitmaps();
+        }
     }
 
     @Override
     public void onDestroy() {
+        handler.removeCallbacks(memCheck);
         removeCover("service stopped");
         if (checker != null) checker.getLooper().quitSafely();
         if (keyWatchBound) {
@@ -343,6 +393,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             wm.addView(cover, coverLp);
         } catch (Exception e) {
             Log.w(TAG, "cover refused, starting the launcher instead: " + e);
+            cover.releaseBitmaps();
             openLauncher(null);
             return;
         }
@@ -455,6 +506,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         Log.i(TAG, "cover down: " + why);
         cover.stopClock();
         cover.hideLaunching();
+        cover.releaseBitmaps();
         coverUp = false;
         picked = false;
         pendingOpen = null;
@@ -496,6 +548,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         setCoverFocusable(false);
         cover.showLaunching(a.label);
         try {
+            AppCatalog.get(this).freeMemory(a.pkg, "launch from cover");
             startActivity(a.intent);
         } catch (Exception e) {
             Log.w(TAG, "couldn't open " + a.pkg + ": " + e);
@@ -507,6 +560,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     @Override public void openLibrary() { openPanel(OPEN_LIBRARY); }
     @Override public void openSettings() { openPanel(OPEN_SETTINGS); }
     @Override public void openWallpapers() { openPanel(OPEN_WALLPAPERS); }
+    @Override public void openTasks() { openPanel(OPEN_TASKS); }
     @Override public void showMenu(AppEntry a, boolean inDock) { openPanel(OPEN_MENU + a.pkg); }
 
     /** Panels live in MainActivity: ask for one now, and it opens when MainActivity can start. */

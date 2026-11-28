@@ -10,6 +10,12 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
+    <!-- Frees other apps' cached background processes when an app is opened. -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+
+    <!-- Granted over ADB by install.sh; lets the Tasks panel read per-app memory (dumpsys meminfo). -->
+    <uses-permission android:name="android.permission.DUMP" />
+
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
@@ -29,8 +35,7 @@
         android:icon="@drawable/icon"
         android:banner="@drawable/banner"
         android:theme="@style/HomeTheme"
-        android:allowBackup="false"
-        android:largeHeap="true">
+        android:allowBackup="false">
 
         <activity
             android:name=".MainActivity"

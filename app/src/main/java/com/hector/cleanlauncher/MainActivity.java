@@ -14,6 +14,8 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -30,6 +32,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,7 +50,7 @@ public class MainActivity extends Activity implements HomeView.Host {
     /** Intent extra from HomeWatcherService: a panel to open once we are in front. */
     static final String EXTRA_OPEN = "open";
     static final String OPEN_LIBRARY = "library", OPEN_SETTINGS = "settings",
-            OPEN_WALLPAPERS = "wallpapers", OPEN_MENU = "menu:", OPEN_ADD = "add";
+            OPEN_WALLPAPERS = "wallpapers", OPEN_TASKS = "tasks", OPEN_MENU = "menu:", OPEN_ADD = "add";
 
     /** Monochrome service marks, keyed by Fire TV package name. */
     static final Map<String, Integer> BRANDS = new HashMap<>();
@@ -137,6 +140,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         super.onResume();
         resumed = true;
         HomeWatcherService.onLauncherResumed();
+        AppCatalog.get(this).freeMemory(null, "home shown");
         syncApps();
         hv.updateNetwork();
         // Pick up where the cover left off, then take it down.
@@ -147,6 +151,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         }
         HomeWatcherService.hideCover();
         hv.startClock();
+        if (tasksOpen && overlay != null) handler.post(tasksTick);
         if (overlay == null && getCurrentFocus() == null) hv.focusDock(false);
     }
 
@@ -158,9 +163,34 @@ public class MainActivity extends Activity implements HomeView.Host {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        hv.applyWallpaper(hv.currentWall());   // no-op if still loaded
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        Log.d("CleanLauncher", "onStop: closing panels, releasing bitmaps");
+        overlayIsWallpaper = false;   // onStart re-applies the saved wallpaper; don't decode now
+        closeOverlay(false);          // drops picker thumbnails, library grid, Tasks timers
+        hv.releaseBitmaps();
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_UI_HIDDEN && !resumed) {
+            Log.d("CleanLauncher", "onTrimMemory " + level + ": releasing bitmaps");
+            hv.releaseBitmaps();
+        }
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         resumed = false;
+        handler.removeCallbacks(tasksTick);
         hv.stopClock();
     }
 
@@ -204,6 +234,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         }
         else if (OPEN_SETTINGS.equals(open)) openSettings();
         else if (OPEN_WALLPAPERS.equals(open)) openWallpapers();
+        else if (OPEN_TASKS.equals(open)) openTasks();
         else if (open.startsWith(OPEN_MENU)) {
             AppEntry a = hv.apps.get(open.substring(OPEN_MENU.length()));
             if (a != null) {
@@ -247,6 +278,7 @@ public class MainActivity extends Activity implements HomeView.Host {
             return;
         }
         try {
+            AppCatalog.get(this).freeMemory(a.pkg, "launch");
             startActivity(a.intent);
         } catch (Exception e) {
             Toast.makeText(this, "Couldn't open " + a.label, Toast.LENGTH_SHORT).show();
@@ -310,6 +342,12 @@ public class MainActivity extends Activity implements HomeView.Host {
         if (overlay == null) return;
         if (pendingPreview != null) handler.removeCallbacks(pendingPreview);
         if (overlayIsWallpaper) hv.applyWallpaper(hv.currentWall());
+        tasksOpen = false;
+        handler.removeCallbacks(tasksTick);
+        taskList = null;
+        ramText = null;
+        ramFill = null;
+        pickerName = pickerCredit = null;   // the picker's thumbnails go with the panel
         root.removeView(overlay);
         overlay = null;
         overlayIsWallpaper = false;
@@ -427,6 +465,11 @@ public class MainActivity extends Activity implements HomeView.Host {
             prefs.edit().putBoolean("clock24", c24).apply();
             ((TextView) v.findViewWithTag("value")).setText(c24 ? "24-hour" : "12-hour");
             hv.updateClock();
+        }));
+        list.addView(settingRow("Free memory when switching apps", prefs.getBoolean("freeMem", true) ? "On" : "Off", v -> {
+            boolean on = !prefs.getBoolean("freeMem", true);
+            prefs.edit().putBoolean("freeMem", on).apply();
+            ((TextView) v.findViewWithTag("value")).setText(on ? "On" : "Off");
         }));
         final String[] darkModes = {HomeView.DARK_OFF, HomeView.DARK_ON, HomeView.DARK_NIGHT};
         final String[] darkNames = {"Off", "On", "At night (7 PM–7 AM)"};
@@ -610,6 +653,223 @@ public class MainActivity extends Activity implements HomeView.Host {
         return r;
     }
 
+    // Tasks ------------------------------------------------------------------
+
+    private boolean tasksOpen, tasksBusy;
+    private LinearLayout taskList;
+    private TextView ramText, taskNote;
+    private View ramFill;
+    private long lastTaskListAt;
+    private static final int RAM_BAR_DP = 720;
+    private final Runnable tasksTick = new Runnable() {
+        @Override public void run() {
+            if (!tasksOpen || overlay == null) return;
+            updateRam();
+            if (SystemClock.uptimeMillis() - lastTaskListAt > 6000) refreshTasks();
+            handler.postDelayed(this, 2000);
+        }
+    };
+
+    @Override
+    public void openTasks() {
+        FrameLayout o = openOverlay(true);
+        tasksOpen = true;
+        title(o, "Tasks");
+
+        View closeAll = taskButton("Close all", v -> closeTasks(null));
+        FrameLayout.LayoutParams bp = new FrameLayout.LayoutParams(-2, dp(32), Gravity.TOP | Gravity.END);
+        bp.rightMargin = dp(56);
+        bp.topMargin = dp(36);
+        o.addView(closeAll, bp);
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(dp(RAM_BAR_DP), -1);
+        cp.leftMargin = dp(56);
+        cp.topMargin = dp(88);
+        o.addView(col, cp);
+
+        ramText = text("", 16, true, INK);
+        col.addView(ramText, new LinearLayout.LayoutParams(-2, -2));
+        FrameLayout track = new FrameLayout(this);
+        GradientDrawable tg = new GradientDrawable();
+        tg.setCornerRadius(dp(4));
+        tg.setColor(0x33FFFFFF);
+        track.setBackground(tg);
+        ramFill = new View(this);
+        GradientDrawable fg = new GradientDrawable();
+        fg.setCornerRadius(dp(4));
+        fg.setColor(INK);
+        ramFill.setBackground(fg);
+        track.addView(ramFill, new FrameLayout.LayoutParams(0, -1));
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, dp(8));
+        tp.topMargin = dp(10);
+        col.addView(track, tp);
+
+        taskNote = text("", 14, false, MUTE);
+        LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(-2, -2);
+        np.topMargin = dp(12);
+        col.addView(taskNote, np);
+
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.setVerticalFadingEdgeEnabled(true);
+        sv.setFadingEdgeLength(dp(32));
+        sv.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        taskList = new LinearLayout(this);
+        taskList.setOrientation(LinearLayout.VERTICAL);
+        taskList.setPadding(0, dp(8), 0, dp(32));
+        sv.addView(taskList, new FrameLayout.LayoutParams(-1, -2));
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        sp.topMargin = dp(8);
+        col.addView(sv, sp);
+
+        updateRam();
+        lastTaskListAt = 0;
+        handler.removeCallbacks(tasksTick);
+        handler.post(tasksTick);
+    }
+
+    private View taskButton(String label, View.OnClickListener click) {
+        final TextView t = text(label, 15, true, INK);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(16), 0, dp(16), 0);
+        t.setFocusable(true);
+        t.setClickable(true);
+        t.setBackground(hv.pill(SOLID));
+        t.setOnFocusChangeListener((v, f) -> t.setTextColor(f ? SOLID_INK : INK));
+        t.setOnClickListener(click);
+        return t;
+    }
+
+    private void updateRam() {
+        if (ramText == null) return;
+        android.app.ActivityManager.MemoryInfo mi = Tasks.memory(this);
+        double gb = 1024.0 * 1024 * 1024;
+        long used = mi.totalMem - mi.availMem;
+        ramText.setText(String.format(java.util.Locale.US, "%.1f GB used of %.1f GB \u00B7 %d MB free",
+                used / gb, mi.totalMem / gb, mi.availMem / (1024 * 1024)));
+        float frac = mi.totalMem > 0 ? Math.min(1f, Math.max(0f, used / (float) mi.totalMem)) : 0f;
+        ViewGroup.LayoutParams lp = ramFill.getLayoutParams();
+        lp.width = Math.round(dp(RAM_BAR_DP) * frac);
+        ramFill.setLayoutParams(lp);
+    }
+
+    /** Read the running apps (needs the DUMP grant) off the main thread, then rebuild the rows. */
+    private void refreshTasks() {
+        if (tasksBusy) return;
+        tasksBusy = true;
+        lastTaskListAt = SystemClock.uptimeMillis();
+        final Map<String, AppEntry> known = new HashMap<>(AppCatalog.get(this).apps());
+        new Thread(() -> {
+            Tasks.Snapshot snap = null;
+            try {
+                snap = Tasks.processes(this, known);
+            } catch (Throwable e) {
+                Log.w("CleanLauncher", "tasks scan failed: " + e);
+            }
+            final Tasks.Snapshot result = snap;
+            handler.post(() -> {
+                tasksBusy = false;
+                if (tasksOpen && taskList != null) fillTasks(known, result);
+            });
+        }, "tasks").start();
+    }
+
+    private void fillTasks(Map<String, AppEntry> known, final Tasks.Snapshot snap) {
+        View f = getCurrentFocus();
+        String focusPkg = f != null && f.getParent() == taskList && f.getTag() instanceof AppEntry
+                ? ((AppEntry) f.getTag()).pkg : null;
+        int focusIdx = focusPkg != null ? taskList.indexOfChild(f) : -1;
+        taskList.removeAllViews();
+        final String top = snap != null ? snap.top : null;
+        List<AppEntry> rows = new ArrayList<>();
+        for (AppEntry a : known.values()) {
+            if (AppCatalog.isProtected(this, a.pkg)) continue;
+            if (snap == null || snap.kb.containsKey(a.pkg) || a.pkg.equals(top)) rows.add(a);
+        }
+        if (snap != null) {
+            Collections.sort(rows, (x, y) -> {
+                if (x.pkg.equals(top) != y.pkg.equals(top)) return x.pkg.equals(top) ? -1 : 1;
+                Long kx = snap.kb.get(x.pkg), ky = snap.kb.get(y.pkg);
+                return Long.compare(ky == null ? 0 : ky, kx == null ? 0 : kx);
+            });
+        } else {
+            Collections.sort(rows, (x, y) -> x.label.compareToIgnoreCase(y.label));
+        }
+        if (snap == null) {
+            taskNote.setText(Tasks.canDump(this) ? "Couldn't read running apps"
+                    : "Run install.sh to see per-app memory");
+        } else {
+            taskNote.setText(rows.isEmpty() ? "No other apps are running" : "Select an app to close it");
+        }
+        List<AppEntry> closable = new ArrayList<>();
+        for (AppEntry a : rows) if (!a.pkg.equals(top)) closable.add(a);
+        taskList.setTag(closable);
+        for (AppEntry a : rows) {
+            taskList.addView(taskRow(a, snap != null ? snap.kb.get(a.pkg) : null, a.pkg.equals(top)));
+        }
+        View target = focusPkg != null ? hv.findTile(taskList, focusPkg) : null;
+        if (target == null && taskList.getChildCount() > 0) {
+            target = taskList.getChildAt(Math.max(0, Math.min(focusIdx, taskList.getChildCount() - 1)));
+        }
+        if (target != null && (f == null || focusPkg != null || overlay.findFocus() == null)) target.requestFocus();
+    }
+
+    private View taskRow(final AppEntry a, Long pssKb, final boolean inUse) {
+        final LinearLayout r = new LinearLayout(this);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(16), 0, dp(16), 0);
+        r.setFocusable(true);
+        r.setClickable(true);
+        r.setBackground(hv.pill(SOLID));
+        r.setTag(a);
+        ImageView ic = new ImageView(this);
+        ic.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        ic.setImageDrawable(hv.iconFor(a));
+        r.addView(ic, new LinearLayout.LayoutParams(dp(40), dp(32)));
+        final TextView l = text(a.label, 16, true, INK);
+        l.setSingleLine(true);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1f);
+        lp.leftMargin = dp(14);
+        r.addView(l, lp);
+        final TextView v = text(inUse ? "In use" : pssKb == null ? ""
+                : pssKb > 0 ? (pssKb / 1024) + " MB" : "\u2014", 16, false, MUTE);
+        r.addView(v, new LinearLayout.LayoutParams(-2, -2));
+        r.setOnFocusChangeListener((view, fo) -> {
+            l.setTextColor(fo ? SOLID_INK : INK);
+            v.setTextColor(fo ? 0xB3141618 : MUTE);
+        });
+        r.setOnClickListener(x -> {
+            if (inUse) Toast.makeText(this, "Can't close the app on screen", Toast.LENGTH_SHORT).show();
+            else closeTasks(a.pkg);
+        });
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, dp(48));
+        rp.bottomMargin = dp(4);
+        r.setLayoutParams(rp);
+        return r;
+    }
+
+    /** Close one app (pkg) or every listed app (null), then refresh the list. */
+    @SuppressWarnings("unchecked")
+    private void closeTasks(String pkg) {
+        final List<String> pkgs = new ArrayList<>();
+        if (pkg != null) {
+            pkgs.add(pkg);
+        } else if (taskList != null && taskList.getTag() instanceof List) {
+            for (AppEntry a : (List<AppEntry>) taskList.getTag()) pkgs.add(a.pkg);
+        }
+        final String what = pkg != null ? "task " + pkg : "close all";
+        new Thread(() -> AppCatalog.killAll(this, pkgs, null, what), "kill").start();
+        lastTaskListAt = 0;
+        handler.postDelayed(() -> {
+            if (tasksOpen) {
+                updateRam();
+                refreshTasks();
+            }
+        }, 500);
+    }
+
     // Wallpaper picker -------------------------------------------------------
 
     @Override
@@ -667,7 +927,7 @@ public class MainActivity extends Activity implements HomeView.Host {
         f.setClickable(true);
         final ImageView img = new ImageView(this);
         img.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        img.setImageBitmap(hv.decode("wallpapers/" + w.id + "-thumb.jpg", 2));
+        img.setImageBitmap(Bitmaps.thumb(this, w.id));
         img.setOutlineProvider(new ViewOutlineProvider() {
             @Override public void getOutline(View v, Outline o) {
                 o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), dp(10));

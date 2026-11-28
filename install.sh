@@ -20,6 +20,7 @@ adb -s "$DEV" shell settings put secure accessibility_enabled 1
 # Optional: lets Clean Launcher see Home presses in the system log (faster, and catches
 # Home pressed while Amazon's home is showing). Undo with: pm revoke $PKG android.permission.READ_LOGS
 adb -s "$DEV" shell pm grant "$PKG" android.permission.READ_LOGS || echo "READ_LOGS not granted; Home detection stays basic."
+adb -s "$DEV" shell pm grant "$PKG" android.permission.DUMP || echo "DUMP not granted; Tasks shows apps without memory use."
 # Lets the launcher show the Wi-Fi network's name (Android 9 hides it from apps otherwise).
 adb -s "$DEV" shell pm grant "$PKG" android.permission.ACCESS_FINE_LOCATION || echo "Location not granted; the Wi-Fi name shows as \"Wi-Fi\"."
 adb -s "$DEV" shell am start -n "$PKG/.MainActivity"

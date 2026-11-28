@@ -13,3 +13,6 @@ local.properties
 .DS_Store
 .idea/
 *.iml
+
+# Local agent notes
+RECOMMENDATIONS.md

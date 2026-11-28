@@ -8,6 +8,9 @@ import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.net.Uri;
+import android.provider.Settings;
+import android.widget.Toast;
 import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -262,11 +265,384 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     @Override
     public void onInterrupt() { }
 
+    // -------------------------------------------------------- force stop (Tasks)
+
+    private static final long FS_PAGE_MS = 6000, FS_DIALOG_MS = 2000, FS_POLL_MS = 200;
+    /** True while the App info automation runs (and shortly after): Home logic stays quiet. */
+    private boolean fsActive;
+    private final List<String[]> fsQueue = new ArrayList<>();   // {pkg, label}
+    private String fsPkg, fsLabel;
+    private long fsDeadline, fsConfirmUntil;
+    
+    private int fsPageWindow = -1, fsDone, fsTotal;
+
+    /**
+     * Force-stop each {pkg, label} through the system App info page, one after another, then
+     * return to the Tasks panel. Returns false if the service isn't running or is busy.
+     */
+    static boolean forceStop(List<String[]> items) {
+        HomeWatcherService s = instance;
+        if (s == null || s.fsActive || items.isEmpty()) return false;
+        for (String[] it : items) {
+            if (!AppCatalog.isProtected(s, it[0])) s.fsQueue.add(it);
+        }
+        if (s.fsQueue.isEmpty()) return false;
+        s.fsActive = true;
+        s.fsDone = 0;
+        s.fsTotal = s.fsQueue.size();
+        s.fsNext();
+        return true;
+    }
+
+    private void fsNext() {
+        if (fsQueue.isEmpty()) {
+            fsFinish();
+            return;
+        }
+        String[] it = fsQueue.remove(0);
+        fsPkg = it[0];
+        fsLabel = it[1];
+        fsStage = S_PAGE;
+        fsAttempt = 0;
+        fsGen++;
+        fsPageWindow = -1;
+        fsDeadline = SystemClock.uptimeMillis() + FS_PAGE_MS;
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + fsPkg)).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));   // fresh page, never a stale one
+            Log.i(TAG, "forcestop: opened App info for " + fsPkg);
+        } catch (Exception e) {
+            Log.w(TAG, "forcestop: couldn't open App info for " + fsPkg + ": " + e);
+            fsItemDone(false);
+            return;
+        }
+        handler.removeCallbacks(fsTick);
+        handler.postDelayed(fsTick, FS_POLL_MS);
+    }
+
+    private void fsItemDone(boolean ok) {
+        handler.removeCallbacks(fsTick);
+        if (ok) fsDone++;
+        fsPkg = null;
+        fsNext();
+    }
+
+    private void fsFinish() {
+        handler.removeCallbacks(fsTick);
+        fsPkg = null;
+        String msg = fsTotal == 1
+                ? (fsDone == 1 ? "Closed " + fsLabel : "Couldn't close " + fsLabel)
+                : "Closed " + fsDone + " of " + fsTotal + " apps";
+        Log.i(TAG, "forcestop: returned to Tasks (" + msg + ")");
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+        try {
+            // Don't leave the last App info page behind in the Settings task.
+            AccessibilityNodeInfo r = getRootInActiveWindow();
+            if (r != null && isSettingsPkg(r.getPackageName())) {
+                boolean back = performGlobalAction(GLOBAL_ACTION_BACK);
+                Log.i(TAG, "forcestop: back out of Settings (" + back + ")");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "forcestop: couldn't go back: " + e);
+        }
+        try {
+            startActivity(new Intent(this, MainActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    .putExtra(EXTRA_OPEN, OPEN_TASKS));
+        } catch (Exception e) {
+            Log.w(TAG, "forcestop: couldn't return to Tasks: " + e);
+        }
+        // Keep Home handling quiet while our own return settles.
+        handler.postDelayed(() -> {
+            if (fsPkg == null) fsActive = false;
+        }, 1500);
+    }
+
+    private final Runnable fsTick = new Runnable() {
+        @Override public void run() {
+            if (fsPkg == null) return;
+            try {
+                fsStep();
+            } catch (Throwable t) {
+                Log.w(TAG, "forcestop: step failed: " + t);
+            }
+            if (fsPkg != null) {
+                handler.removeCallbacks(this);   // fsNext() may have queued a tick already
+                handler.postDelayed(this, FS_POLL_MS);
+            }
+        }
+    };
+
+    private static boolean isSettingsPkg(CharSequence p) {
+        if (p == null) return false;
+        String s = p.toString();
+        return s.startsWith("com.amazon.tv.settings") || s.equals("com.android.settings")
+                || s.equals("com.android.tv.settings");
+    }
+
+    private static final int S_PAGE = 0, S_SETTLE = 1, S_GESTURE = 2, S_CONFIRM = 3, S_VERIFY = 4;
+    private int fsStage = S_PAGE, fsAttempt, fsGen;
+    private long fsStageAt;
+
+    /** The page's Force stop node, after the safety check; null (and a reason) if not yet. */
+    private AccessibilityNodeInfo fsFindButton(String[] why) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        CharSequence wp = root != null ? root.getPackageName() : null;
+        if (root == null) {
+            why[0] = "no active window";
+            return null;
+        }
+        if (!isSettingsPkg(wp)) {
+            why[0] = "window is " + wp;
+            return null;
+        }
+        StringBuilder text = new StringBuilder();
+        AccessibilityNodeInfo fs = fsCollect(root, text);
+        String t = text.toString();
+        if (!t.contains(fsLabel.toLowerCase()) && !t.contains(fsPkg.toLowerCase())) {
+            why[0] = "page doesn't show " + fsLabel;
+            return null;
+        }
+        if (fs == null) {
+            why[0] = "no Force stop button yet";
+            return null;
+        }
+        try {
+            AccessibilityWindowInfo w = root.getWindow();
+            fsPageWindow = w != null ? w.getId() : -1;
+        } catch (Exception ignored) { fsPageWindow = -1; }
+        why[0] = "passed (" + wp + ")";
+        return fs;
+    }
+
+    private static AccessibilityNodeInfo clickableOf(AccessibilityNodeInfo n) {
+        while (n != null && !n.isClickable()) n = n.getParent();
+        return n;
+    }
+
+    /** A real touch at the centre of the node (ACTION_CLICK is ignored by the Fire TV Settings rows). */
+    private boolean fsTap(AccessibilityNodeInfo n, final int gen, final boolean verifyAfter) {
+        if (android.os.Build.VERSION.SDK_INT < 24) return n.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        android.graphics.Rect r = new android.graphics.Rect();
+        n.getBoundsInScreen(r);
+        if (r.isEmpty()) return false;
+        android.graphics.Path path = new android.graphics.Path();
+        path.moveTo(r.centerX(), r.centerY());
+        android.accessibilityservice.GestureDescription g =
+                new android.accessibilityservice.GestureDescription.Builder().addStroke(
+                        new android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, 50)).build();
+        Log.i(TAG, "forcestop: tapped at " + r.centerX() + "," + r.centerY());
+        boolean sent = dispatchGesture(g, new GestureResultCallback() {
+            @Override public void onCompleted(android.accessibilityservice.GestureDescription d) {
+                Log.i(TAG, "forcestop: gesture completed");
+                fsAfterGesture(gen, verifyAfter);
+            }
+            @Override public void onCancelled(android.accessibilityservice.GestureDescription d) {
+                Log.w(TAG, "forcestop: gesture cancelled");
+                fsAfterGesture(gen, verifyAfter);
+            }
+        }, handler);
+        if (!sent) Log.w(TAG, "forcestop: dispatchGesture refused");
+        return sent;
+    }
+
+    private void fsAfterGesture(int gen, boolean verifyAfter) {
+        if (gen != fsGen || fsPkg == null) return;
+        if (verifyAfter) {
+            fsVerify();
+        } else {
+            fsStage = S_CONFIRM;   // a confirmation dialog may follow (Fire OS showed none)
+            fsStageAt = SystemClock.uptimeMillis() + 1000;
+        }
+    }
+
+    /** ~800 ms after the tap: is the app really gone? Only then report success. */
+    private void fsVerify() {
+        fsStage = S_VERIFY;
+        final int gen = fsGen;
+        final String pkg = fsPkg;
+        handler.postDelayed(() -> {
+            if (gen != fsGen || fsPkg == null) return;
+            final java.util.Map<String, AppEntry> known = new HashMap<>(AppCatalog.get(this).apps());
+            new Thread(() -> {
+                Tasks.Snapshot snap = null;
+                try {
+                    snap = Tasks.processes(this, known);
+                } catch (Throwable ignored) { }
+                final Tasks.Snapshot r = snap;
+                handler.post(() -> {
+                    if (gen != fsGen || fsPkg == null) return;
+                    if (r != null && !r.kb.containsKey(pkg)) {
+                        Log.i(TAG, "forcestop: verified stopped: " + pkg);
+                        fsItemDone(true);
+                    } else if (fsAttempt == 0) {
+                        Log.i(TAG, "forcestop: still running, retrying: " + pkg
+                                + (r == null ? " (couldn't read the process list)" : ""));
+                        fsAttempt = 1;
+                        fsGen++;
+                        fsStage = S_SETTLE;
+                        fsStageAt = SystemClock.uptimeMillis() + 300;
+                        fsDeadline = SystemClock.uptimeMillis() + 4000;
+                    } else {
+                        Log.w(TAG, "forcestop: still running, giving up: " + pkg
+                                + (r == null ? " (couldn't read the process list)" : ""));
+                        fsItemDone(false);
+                    }
+                });
+            }, "fs-verify").start();
+        }, 800);
+    }
+
+    private void fsStep() {
+        long now = SystemClock.uptimeMillis();
+        final String pkg = fsPkg;
+        switch (fsStage) {
+            case S_PAGE: {
+                String[] why = new String[1];
+                AccessibilityNodeInfo fs = fsFindButton(why);
+                if (fs == null) {
+                    if (now > fsDeadline) {
+                        Log.w(TAG, "forcestop: timeout (page check failed: " + why[0] + ") for " + pkg);
+                        fsItemDone(false);
+                    }
+                    return;   // still loading: never click anything until the check passes
+                }
+                Log.i(TAG, "forcestop: page check " + why[0] + " for " + pkg);
+                if (!fs.isEnabled()) {
+                    Log.i(TAG, "forcestop: button disabled, " + pkg + " is already stopped");
+                    fsItemDone(true);
+                    return;
+                }
+                fsStage = S_SETTLE;   // let the list settle before tapping
+                fsStageAt = now + 400;
+                return;
+            }
+            case S_SETTLE: {
+                if (now < fsStageAt) return;
+                String[] why = new String[1];
+                AccessibilityNodeInfo fs = fsFindButton(why);   // same safety check, again
+                if (fs == null) {
+                    if (now > fsDeadline) {
+                        Log.w(TAG, "forcestop: timeout (page check failed: " + why[0] + ") for " + pkg);
+                        fsItemDone(false);
+                    }
+                    return;
+                }
+                if (!fs.isEnabled()) {
+                    Log.i(TAG, "forcestop: button disabled, " + pkg + " is already stopped");
+                    fsItemDone(true);
+                    return;
+                }
+                AccessibilityNodeInfo box = clickableOf(fs);
+                if (box == null) box = fs;
+                if (fsAttempt > 0) {
+                    boolean f = box.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                    boolean c = box.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                    Log.i(TAG, "forcestop: retry focus=" + f + " click=" + c);
+                }
+                fsGen++;
+                fsStage = S_GESTURE;
+                fsStageAt = now + 2500;   // if the callback never comes
+                if (!fsTap(box, fsGen, false)) {
+                    fsStage = S_CONFIRM;
+                    fsStageAt = now + 1000;
+                }
+                return;
+            }
+            case S_GESTURE:
+                if (now > fsStageAt) {
+                    Log.w(TAG, "forcestop: no gesture result, going on");
+                    fsStage = S_CONFIRM;
+                    fsStageAt = now + 1000;
+                }
+                return;
+            case S_CONFIRM:
+                if (fsConfirm()) {
+                    Log.i(TAG, "forcestop: dialog confirmed for " + pkg);
+                    fsStage = S_VERIFY;   // fsConfirm's tap verifies after its gesture
+                    return;
+                }
+                if (now > fsStageAt) {
+                    Log.i(TAG, "forcestop: no dialog for " + pkg);
+                    fsVerify();
+                }
+                return;
+            default:
+                return;   // S_VERIFY: waiting for the scan
+        }
+    }
+
+    /** Walk the page: gather its text, and return the "Force stop" node if there is one. */
+    private AccessibilityNodeInfo fsCollect(AccessibilityNodeInfo n, StringBuilder text) {
+        AccessibilityNodeInfo found = null;
+        java.util.ArrayDeque<AccessibilityNodeInfo> q = new java.util.ArrayDeque<>();
+        q.add(n);
+        int seen = 0;
+        while (!q.isEmpty() && seen++ < 800) {
+            AccessibilityNodeInfo x = q.poll();
+            CharSequence t = x.getText(), d = x.getContentDescription();
+            if (t != null) text.append(t.toString().toLowerCase()).append('\n');
+            if (d != null) text.append(d.toString().toLowerCase()).append('\n');
+            if (found == null && (isForceStop(t) || isForceStop(d))) found = x;
+            for (int i = 0; i < x.getChildCount(); i++) {
+                AccessibilityNodeInfo c = x.getChild(i);
+                if (c != null) q.add(c);
+            }
+        }
+        return found;
+    }
+
+    private static boolean isForceStop(CharSequence s) {
+        if (s == null) return false;
+        String t = s.toString().trim().toLowerCase();
+        return t.equals("force stop") || t.equals("forzar detención") || t.equals("forzar detencion")
+                || t.equals("forzar cierre");
+    }
+
+    /** Click a confirmation button in a Settings window; the app page's own button is skipped. */
+    private boolean fsConfirm() {
+        List<AccessibilityWindowInfo> wins;
+        try {
+            wins = getWindows();
+        } catch (Exception e) {
+            return false;
+        }
+        if (wins == null) return false;
+        for (AccessibilityWindowInfo w : wins) {
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root == null || !isSettingsPkg(root.getPackageName())) continue;
+            boolean pageWindow = w.getId() == fsPageWindow;
+            java.util.ArrayDeque<AccessibilityNodeInfo> q = new java.util.ArrayDeque<>();
+            q.add(root);
+            int seen = 0;
+            while (!q.isEmpty() && seen++ < 800) {
+                AccessibilityNodeInfo x = q.poll();
+                CharSequence t = x.getText();
+                String tl = t == null ? "" : t.toString().trim().toLowerCase();
+                boolean hit = "android:id/button1".equals(x.getViewIdResourceName())
+                        || tl.equals("ok") || tl.equals("aceptar")
+                        || (!pageWindow && isForceStop(t));
+                if (hit && x.isEnabled()) {
+                    AccessibilityNodeInfo n = clickableOf(x);
+                    if (n != null && fsTap(n, fsGen, true)) return true;
+                }
+                for (int i = 0; i < x.getChildCount(); i++) {
+                    AccessibilityNodeInfo c = x.getChild(i);
+                    if (c != null) q.add(c);
+                }
+            }
+        }
+        return false;
+    }
+
     // ------------------------------------------------------------------ events
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent e) {
         if (e.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
+        if (fsActive) return;   // force-stop flow: Settings and our own return are not Home
         CharSequence p = e.getPackageName();
         if (p == null) return;
         String pkg = p.toString();
@@ -347,6 +723,7 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
     /** From HomeKeyWatcher: the system started the HOME intent, i.e. Home was pressed. */
     private void onHomeKey(int uid) {
+        if (fsActive) return;
         if (uid != android.os.Process.SYSTEM_UID && uid != 0) return;
         long now = SystemClock.uptimeMillis();
         boolean second = now - lastHomeKeyAt < DOUBLE_PRESS_MS;

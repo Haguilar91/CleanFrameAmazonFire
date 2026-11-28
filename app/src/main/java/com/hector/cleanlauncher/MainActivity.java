@@ -804,10 +804,18 @@ public class MainActivity extends Activity implements HomeView.Host {
             taskNote.setText(rows.isEmpty() ? "No other apps are running" : "Select an app to close it");
         }
         List<AppEntry> closable = new ArrayList<>();
-        for (AppEntry a : rows) if (!a.pkg.equals(top)) closable.add(a);
+        for (AppEntry a : rows) {
+            Integer k = snap != null ? snap.kind.get(a.pkg) : null;
+            // Close all skips apps that keep a foreground service (they ask first when selected).
+            if (!a.pkg.equals(top) && (k == null || k != Tasks.KIND_FOREGROUND)) closable.add(a);
+        }
+        reasonViews.clear();
+        reasonTexts.clear();
         taskList.setTag(closable);
         for (AppEntry a : rows) {
-            taskList.addView(taskRow(a, snap != null ? snap.kb.get(a.pkg) : null, a.pkg.equals(top)));
+            Integer k = snap != null ? snap.kind.get(a.pkg) : null;
+            taskList.addView(taskRow(a, snap != null ? snap.kb.get(a.pkg) : null, a.pkg.equals(top),
+                    k == null ? Tasks.KIND_NORMAL : k));
         }
         View target = focusPkg != null ? hv.findTile(taskList, focusPkg) : null;
         if (target == null && taskList.getChildCount() > 0) {
@@ -816,10 +824,46 @@ public class MainActivity extends Activity implements HomeView.Host {
         if (target != null && (f == null || focusPkg != null || overlay.findFocus() == null)) target.requestFocus();
     }
 
-    private View taskRow(final AppEntry a, Long pssKb, final boolean inUse) {
+    private String confirmPkg;
+    private long confirmAt;
+    private final Map<String, TextView> reasonViews = new HashMap<>();
+    private final Map<String, String> reasonTexts = new HashMap<>();
+    private static final long CONFIRM_MS = 4000;
+
+    private static boolean isSpotify(String pkg) {
+        return pkg.startsWith("com.spotify.");
+    }
+
+    private String reasonFor(String pkg, int kind) {
+        if (kind == Tasks.KIND_FOREGROUND) {
+            return isSpotify(pkg) ? "Stays on so your phone can use this TV as a Spotify speaker"
+                    : "Stays running in the background (music, casting or downloads)";
+        }
+        if (kind == Tasks.KIND_SERVICE) return "Runs a background service and may restart itself";
+        return null;
+    }
+
+    private String confirmTextFor(String pkg) {
+        return isSpotify(pkg) ? "Press again to force stop. This TV will disappear from Spotify on your phone"
+                : "Press again to force stop. It will stop playing and disappear from other devices";
+    }
+
+    private boolean confirming(String pkg) {
+        return pkg.equals(confirmPkg) && SystemClock.uptimeMillis() - confirmAt < CONFIRM_MS;
+    }
+
+    private void resetConfirm() {
+        String p = confirmPkg;
+        confirmPkg = null;
+        TextView t = p != null ? reasonViews.get(p) : null;
+        if (t != null && reasonTexts.get(p) != null) t.setText(reasonTexts.get(p));
+    }
+
+    private View taskRow(final AppEntry a, Long pssKb, final boolean inUse, final int kind) {
         final LinearLayout r = new LinearLayout(this);
         r.setGravity(Gravity.CENTER_VERTICAL);
-        r.setPadding(dp(16), 0, dp(16), 0);
+        r.setPadding(dp(16), dp(8), dp(16), dp(8));
+        r.setMinimumHeight(dp(48));
         r.setFocusable(true);
         r.setClickable(true);
         r.setBackground(hv.pill(SOLID));
@@ -828,29 +872,62 @@ public class MainActivity extends Activity implements HomeView.Host {
         ic.setScaleType(ImageView.ScaleType.FIT_CENTER);
         ic.setImageDrawable(hv.iconFor(a));
         r.addView(ic, new LinearLayout.LayoutParams(dp(40), dp(32)));
+        LinearLayout names = new LinearLayout(this);
+        names.setOrientation(LinearLayout.VERTICAL);
         final TextView l = text(a.label, 16, true, INK);
         l.setSingleLine(true);
+        names.addView(l, new LinearLayout.LayoutParams(-2, -2));
+        final String reason = inUse ? null : reasonFor(a.pkg, kind);
+        TextView why = null;
+        if (reason != null) {
+            reasonTexts.put(a.pkg, reason);
+            why = text(confirming(a.pkg) ? confirmTextFor(a.pkg) : reason, 12, false, MUTE);
+            reasonViews.put(a.pkg, why);
+            LinearLayout.LayoutParams wp = new LinearLayout.LayoutParams(-2, -2);
+            wp.topMargin = dp(2);
+            names.addView(why, wp);
+        }
+        final TextView whyView = why;
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1f);
         lp.leftMargin = dp(14);
-        r.addView(l, lp);
+        lp.rightMargin = dp(12);
+        r.addView(names, lp);
         final TextView v = text(inUse ? "In use" : pssKb == null ? ""
                 : pssKb > 0 ? (pssKb / 1024) + " MB" : "\u2014", 16, false, MUTE);
         r.addView(v, new LinearLayout.LayoutParams(-2, -2));
         r.setOnFocusChangeListener((view, fo) -> {
             l.setTextColor(fo ? SOLID_INK : INK);
             v.setTextColor(fo ? 0xB3141618 : MUTE);
+            if (whyView != null) whyView.setTextColor(fo ? 0xB3141618 : MUTE);
+            if (!fo && a.pkg.equals(confirmPkg)) resetConfirm();
         });
         r.setOnClickListener(x -> {
-            if (inUse) Toast.makeText(this, "Can't close the app on screen", Toast.LENGTH_SHORT).show();
-            else closeTasks(a.pkg);
+            if (inUse) {
+                Toast.makeText(this, "Can't close the app on screen", Toast.LENGTH_SHORT).show();
+            } else if (kind == Tasks.KIND_FOREGROUND && !confirming(a.pkg)) {
+                // First press: ask. A second press within 4 s force stops it.
+                confirmPkg = a.pkg;
+                confirmAt = SystemClock.uptimeMillis();
+                if (whyView != null) whyView.setText(confirmTextFor(a.pkg));
+                handler.postDelayed(() -> {
+                    if (a.pkg.equals(confirmPkg) && !confirming(a.pkg)) resetConfirm();
+                }, CONFIRM_MS + 100);
+            } else {
+                resetConfirm();
+                closeTasks(a.pkg);
+            }
         });
-        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, dp(48));
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(-1, -2);
         rp.bottomMargin = dp(4);
         r.setLayoutParams(rp);
         return r;
     }
 
-    /** Close one app (pkg) or every listed app (null), then refresh the list. */
+    /**
+     * Close one app (pkg) or every listed app (null). Kill the cached processes first; apps
+     * still alive 800 ms later (foreground services, restarting services) are force-stopped
+     * through the App info page by HomeWatcherService, then it returns here to Tasks.
+     */
     @SuppressWarnings("unchecked")
     private void closeTasks(String pkg) {
         final List<String> pkgs = new ArrayList<>();
@@ -860,14 +937,46 @@ public class MainActivity extends Activity implements HomeView.Host {
             for (AppEntry a : (List<AppEntry>) taskList.getTag()) pkgs.add(a.pkg);
         }
         final String what = pkg != null ? "task " + pkg : "close all";
-        new Thread(() -> AppCatalog.killAll(this, pkgs, null, what), "kill").start();
+        final Map<String, AppEntry> known = new HashMap<>(AppCatalog.get(this).apps());
         lastTaskListAt = 0;
-        handler.postDelayed(() -> {
-            if (tasksOpen) {
-                updateRam();
-                refreshTasks();
+        new Thread(() -> {
+            AppCatalog.killAll(this, pkgs, null, what);
+            try {
+                Thread.sleep(800);
+            } catch (InterruptedException ignored) { }
+            Tasks.Snapshot snap = null;
+            try {
+                snap = Tasks.processes(this, known);
+            } catch (Throwable e) {
+                Log.w("CleanLauncher", "tasks re-scan failed: " + e);
             }
-        }, 500);
+            final List<String[]> left = new ArrayList<>();
+            if (snap != null) {
+                for (String p : pkgs) {
+                    AppEntry a = known.get(p);
+                    if (a == null || !snap.kb.containsKey(p) || p.equals(snap.top)
+                            || AppCatalog.isProtected(this, p)) continue;
+                    if (left.size() < 6) left.add(new String[]{p, a.label});
+                }
+            }
+            handler.post(() -> {
+                if (left.isEmpty()) {
+                    if (tasksOpen) {
+                        updateRam();
+                        refreshTasks();
+                    }
+                    return;
+                }
+                String msg = left.size() == 1 ? "Closing " + left.get(0)[1] + "\u2026"
+                        : "Closing " + left.size() + " apps\u2026";
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+                Log.i("CleanLauncher", "forcestop: " + left.size() + " app(s) survived the kill");
+                if (!HomeWatcherService.forceStop(left)) {
+                    Log.w("CleanLauncher", "forcestop: service not available or busy");
+                    if (tasksOpen) refreshTasks();
+                }
+            });
+        }, "kill").start();
     }
 
     // Wallpaper picker -------------------------------------------------------

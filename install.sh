@@ -15,6 +15,11 @@ CUR=$(adb -s "$DEV" shell settings get secure enabled_accessibility_services | t
 if [ -z "$CUR" ] || [ "$CUR" = "null" ]; then NEW="$SVC"
 elif echo "$CUR" | grep -q "$SVC"; then NEW="$CUR"
 else NEW="$CUR:$SVC"; fi
+# A reinstall doesn't refresh the service's capabilities (e.g. gestures) until it is toggled:
+# take ours out of the list (keeping any other services), wait, then put it back.
+OTHERS=$(echo "$NEW" | tr ':' '\n' | grep -v -x -F "$SVC" | paste -sd: - || true)
+adb -s "$DEV" shell settings put secure enabled_accessibility_services "${OTHERS:-null}"
+sleep 2
 adb -s "$DEV" shell settings put secure enabled_accessibility_services "$NEW"
 adb -s "$DEV" shell settings put secure accessibility_enabled 1
 # Optional: lets Clean Launcher see Home presses in the system log (faster, and catches

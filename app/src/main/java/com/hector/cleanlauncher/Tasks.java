@@ -49,10 +49,18 @@ final class Tasks {
     static final class Snapshot {
         final Map<String, Long> kb = new HashMap<>();
         String top;
+        /** LRU reason in parentheses per package, e.g. "fg-service", "cch-started-services". */
+        final Map<String, String> reason = new HashMap<>();
+        /** Per package: 0 normal, 1 runs a started service, 2 foreground service (stays running). */
+        final Map<String, Integer> kind = new HashMap<>();
     }
+
+    static final int KIND_NORMAL = 0, KIND_SERVICE = 1, KIND_FOREGROUND = 2;
 
     private static final Pattern RECORD = Pattern.compile("ProcessRecord\\{\\w+ (\\d+):([^/\\s]+)/");
     private static final Pattern PSS = Pattern.compile("lastPss=([0-9]*\\.?[0-9]+)\\s*([A-Za-z]*)");
+    private static final Pattern LRU = Pattern.compile(
+            "Proc\\s*#\\s*\\d+:\\s*(.*?)\\s+trm:.*?(\\d+):([^/\\s]+)/\\S+\\s*(?:\\(([^)]*)\\))?\\s*$");
     private static final Pattern TOP = Pattern.compile("(\\d+):([^/\\s]+)/\\S+\\s+\\(top-activity\\)");
 
     /**
@@ -136,6 +144,22 @@ final class Tasks {
                 if (out.top == null && line.contains("(top-activity)")) {
                     Matcher m = TOP.matcher(line);
                     if (m.find()) out.top = pkgOf(m.group(2));
+                }
+                if (line.contains("Proc #")) {
+                    Matcher m = LRU.matcher(line);
+                    if (m.find()) {
+                        String pkg = pkgOf(m.group(3));
+                        String state = m.group(1), why = m.group(4) == null ? "" : m.group(4);
+                        int k = KIND_NORMAL;
+                        if (why.contains("fg-service") || state.matches(".*\\bprcp\\b.*")
+                                || state.matches(".*(?<![A-Z])FGS.*")) k = KIND_FOREGROUND;
+                        else if (why.contains("started-services")) k = KIND_SERVICE;
+                        Integer old = out.kind.get(pkg);
+                        if (old == null || k > old) {
+                            out.kind.put(pkg, k);
+                            out.reason.put(pkg, why);
+                        }
+                    }
                 }
                 return;
             }

@@ -17,8 +17,10 @@ in plain Java.
 | **Home, list layout** | **Apps, list layout** |
 | ![Home in list layout](docs/screenshots/home-list.jpg) | ![Apps in list layout](docs/screenshots/apps-list.jpg) |
 
-<sub>Screenshots are from the Android TV emulator, so the dock shows its
-built-in apps. On a real TV it shows your streaming apps with their logos.</sub>
+<sub>The Tasks screenshot is from a Fire TV Stick 4K Max. Tasks explains apps
+that keep running, such as Spotify staying on as a speaker. The others are
+from the Android TV emulator, so the dock shows its built-in apps. On a real
+TV it shows your streaming apps with their logos.</sub>
 
 ## Supported devices
 

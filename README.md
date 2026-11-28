@@ -14,6 +14,8 @@ in plain Java.
 | ![Wallpaper picker](docs/screenshots/wallpaper.jpg) | ![Apps](docs/screenshots/apps.jpg) |
 | **Tasks** | **Settings** |
 | ![Tasks](docs/screenshots/tasks.jpg) | ![Settings](docs/screenshots/settings.jpg) |
+| **Home, list layout** | **Apps, list layout** |
+| ![Home in list layout](docs/screenshots/home-list.jpg) | ![Apps in list layout](docs/screenshots/apps-list.jpg) |
 
 <sub>Screenshots are from the Android TV emulator, so the dock shows its
 built-in apps. On a real TV it shows your streaming apps with their logos.</sub>

@@ -63,7 +63,10 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
     static final String[] KNOWN_HOMES = {
             "com.amazon.tv.launcher", "com.amazon.firehomestarter",
-            "com.amazon.tv.leanbacklauncher", "com.amazon.tv.ui.launcher"};
+            "com.amazon.tv.leanbacklauncher", "com.amazon.tv.ui.launcher",
+            // Google TV / Android TV (emulators and other boxes)
+            "com.google.android.apps.tv.launcherx", "com.google.android.tvlauncher",
+            "com.google.android.leanbacklauncher"};
 
     /** Ignored while learning: overlays and keyboards, not home screens. */
     static final String[] NOT_HOMES = {
@@ -324,11 +327,13 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     /** Whether a window-state event names an activity (a screen), not a dialog or view. */
     private boolean isActivity(String pkg, CharSequence cls) {
         if (cls == null) return true;
-        String key = pkg + "/" + cls;
+        String name = cls.toString();
+        if (name.startsWith(".")) name = pkg + name;   // relative class names, e.g. ".home.HomeActivity"
+        String key = pkg + "/" + name;
         Boolean known = activityClasses.get(key);
         if (known == null) {
             try {
-                getPackageManager().getActivityInfo(new ComponentName(pkg, cls.toString()), 0);
+                getPackageManager().getActivityInfo(new ComponentName(pkg, name), 0);
                 known = true;
             } catch (PackageManager.NameNotFoundException e) {
                 known = false;

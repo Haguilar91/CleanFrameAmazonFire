@@ -7,6 +7,30 @@ It's modelled on [CleanFrame](https://github.com/nthnclrk/CleanFrame), a
 launcher for Samsung's The Frame TV, and rebuilt as a small native Android app
 in plain Java.
 
+![Home screen](docs/screenshots/home.jpg)
+
+| Wallpaper picker | Apps |
+|---|---|
+| ![Wallpaper picker](docs/screenshots/wallpaper.jpg) | ![Apps](docs/screenshots/apps.jpg) |
+| **Tasks** | **Settings** |
+| ![Tasks](docs/screenshots/tasks.jpg) | ![Settings](docs/screenshots/settings.jpg) |
+
+<sub>Screenshots are from the Android TV emulator, so the dock shows its
+built-in apps. On a real TV it shows your streaming apps with their logos.</sub>
+
+## Supported devices
+
+| Device | Status |
+|---|---|
+| Fire TV Stick 4K Max (Fire OS 7) | Used daily |
+| Android TV / Google TV (Android 12) | Tested in the emulator |
+
+On both, the Home button reaches Clean Launcher through the accessibility
+service. Fire OS doesn't allow changing the default launcher, and Google TV
+ignores the setting. On Google TV, Clean Launcher appears straight away on a
+Home press. Android briefly blocks starting apps after Home is pressed, so it
+takes about 5 seconds to take over fully.
+
 ## What you get
 
 - **A calm home screen.** A full-screen photo (15 from Unsplash are included),
@@ -63,10 +87,12 @@ options), then from a computer on the same network:
 - grants a few optional permissions:
   - reading the system log, for faster Home detection;
   - location, so it can show the Wi-Fi network's name;
-  - diagnostics (`DUMP`), so Tasks can show memory per app.
+  - diagnostics and usage access (`DUMP`, `GET_USAGE_STATS`), so Tasks can show memory per app.
 
 To update without switching what's on screen, run `adb install -r
-CleanLauncher.apk` instead and re-grant those permissions.
+CleanLauncher.apk` instead and re-grant those permissions (including
+`adb shell pm grant com.hector.cleanlauncher android.permission.PACKAGE_USAGE_STATS`
+and `adb shell appops set com.hector.cleanlauncher GET_USAGE_STATS allow`).
 
 ## Rebuild
 

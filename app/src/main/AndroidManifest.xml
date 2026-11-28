@@ -15,11 +15,21 @@
 
     <!-- Granted over ADB by install.sh; lets the Tasks panel read per-app memory (dumpsys meminfo). -->
     <uses-permission android:name="android.permission.DUMP" />
+    <!-- Since Android 8 an ActivityManager dump also needs usage access: appops set ... GET_USAGE_STATS allow. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
 
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <queries>
+        <!-- Android 11+: lets isActivity() look up the home packages' activity classes. -->
+        <package android:name="com.amazon.tv.launcher" />
+        <package android:name="com.amazon.firehomestarter" />
+        <package android:name="com.amazon.tv.leanbacklauncher" />
+        <package android:name="com.amazon.tv.ui.launcher" />
+        <package android:name="com.google.android.apps.tv.launcherx" />
+        <package android:name="com.google.android.tvlauncher" />
+        <package android:name="com.google.android.leanbacklauncher" />
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />

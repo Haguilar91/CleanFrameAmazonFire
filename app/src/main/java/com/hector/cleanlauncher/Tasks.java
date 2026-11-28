@@ -1,6 +1,7 @@
 package com.hector.cleanlauncher;
 
 import android.app.ActivityManager;
+import android.app.AppOpsManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.util.Log;
@@ -34,7 +35,14 @@ final class Tasks {
     }
 
     static boolean canDump(Context c) {
-        return c.checkSelfPermission(DUMP) == PackageManager.PERMISSION_GRANTED;
+        if (c.checkSelfPermission(DUMP) != PackageManager.PERMISSION_GRANTED) return false;
+        try {
+            AppOpsManager ops = (AppOpsManager) c.getSystemService(Context.APP_OPS_SERVICE);
+            return ops != null && ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    android.os.Process.myUid(), c.getPackageName()) == AppOpsManager.MODE_ALLOWED;
+        } catch (Throwable e) {
+            return false;
+        }
     }
 
     /** Running apps: package to PSS in KB (processes summed), and the app in front (or null). */
@@ -56,7 +64,7 @@ final class Tasks {
      */
     static Snapshot processes(Context c, Map<String, ?> known) {
         if (!canDump(c)) {
-            Log.w(TAG, "tasks: DUMP not granted");
+            Log.w(TAG, "tasks: DUMP or usage access (GET_USAGE_STATS app op) not granted");
             return null;
         }
         Parser p = new Parser(c, known);
@@ -66,7 +74,7 @@ final class Tasks {
                 Log.d(TAG, "tasks: source=binder");
                 return p.result();
             }
-            Log.w(TAG, "tasks: binder failed: no ProcessRecord lines (" + p.lines() + " lines), trying dumpsys");
+            Log.w(TAG, "tasks: binder failed: no ProcessRecord lines (" + p.lines() + " lines, first 200 chars: \"" + p.head() + "\"), trying dumpsys");
         } catch (Throwable e) {
             Log.w(TAG, "tasks: binder failed: " + e + ", trying dumpsys");
         }
@@ -77,7 +85,7 @@ final class Tasks {
                 Log.d(TAG, "tasks: source=dumpsys");
                 return p.result();
             }
-            Log.w(TAG, "tasks: dumpsys failed: no ProcessRecord lines (" + p.lines() + " lines)");
+            Log.w(TAG, "tasks: dumpsys failed: no ProcessRecord lines (" + p.lines() + " lines, first 200 chars: \"" + p.head() + "\"; " + p.exitInfo + ")");
         } catch (Throwable e) {
             Log.w(TAG, "tasks: dumpsys failed: " + e);
         }
@@ -93,6 +101,8 @@ final class Tasks {
         private String cur;
         private boolean wantPss, inLru, saw, done;
         private int lines;
+        private final StringBuilder head = new StringBuilder();
+        String exitInfo = "";
 
         Parser(Context c, Map<String, ?> known) {
             this.c = c;
@@ -101,6 +111,8 @@ final class Tasks {
 
         synchronized boolean sawRecord() { return saw; }
         synchronized int lines() { return lines; }
+        /** The first 200 characters read (lines joined by " | "), for diagnosing failures. */
+        synchronized String head() { return head.toString(); }
         synchronized Snapshot result() {
             done = true;   // ignore anything an abandoned reader still delivers
             return out;
@@ -109,6 +121,11 @@ final class Tasks {
         synchronized void feed(String line) {
             if (done) return;
             lines++;
+            if (head.length() < 200) {
+                if (head.length() > 0) head.append(" | ");
+                head.append(line, 0, Math.min(line.length(), 200 - Math.min(head.length(), 200)));
+                if (head.length() > 200) head.setLength(200);
+            }
             if (line.contains("ProcessRecord")) saw = true;
             if (line.contains("Process LRU list")) {
                 inLru = true;
@@ -163,7 +180,17 @@ final class Tasks {
         Process p = new ProcessBuilder("dumpsys", "activity", "processes")
                 .redirectErrorStream(true).start();
         try {
-            readLines(p.getInputStream(), parser, 5000);
+            readLines(p.getInputStream(), parser, 5000);   // stderr is merged into stdout
+            int code = -999;
+            for (int i = 0; i < 10; i++) {
+                try {
+                    code = p.exitValue();
+                    break;
+                } catch (IllegalThreadStateException running) {
+                    Thread.sleep(100);
+                }
+            }
+            parser.exitInfo = code == -999 ? "exit code: still running" : "exit code: " + code;
         } finally {
             p.destroy();   // also on timeout
         }

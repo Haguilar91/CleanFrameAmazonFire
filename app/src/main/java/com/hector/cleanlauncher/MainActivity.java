@@ -111,6 +111,7 @@ public class MainActivity extends Activity implements HomeView.Host {
     private boolean pickingForHome;
     private TextView pickerName, pickerCredit;
 
+    private static boolean launcherShownBefore;
     private boolean resumed;
     /** The shared app list changed: rebuild now if we're showing, else on the next resume. */
     private final Runnable appsChanged = () -> {
@@ -140,7 +141,8 @@ public class MainActivity extends Activity implements HomeView.Host {
         super.onResume();
         resumed = true;
         HomeWatcherService.onLauncherResumed();
-        AppCatalog.get(this).freeMemory(null, "home shown");
+        if (launcherShownBefore) HomeWatcherService.onHomeShown();   // not the first start
+        launcherShownBefore = true;
         syncApps();
         hv.updateNetwork();
         // Pick up where the cover left off, then take it down.
@@ -190,6 +192,7 @@ public class MainActivity extends Activity implements HomeView.Host {
     protected void onPause() {
         super.onPause();
         resumed = false;
+        HomeWatcherService.cancelCleanup();
         handler.removeCallbacks(tasksTick);
         hv.stopClock();
     }
@@ -278,6 +281,7 @@ public class MainActivity extends Activity implements HomeView.Host {
             return;
         }
         try {
+            HomeWatcherService.cancelCleanup();
             AppCatalog.get(this).freeMemory(a.pkg, "launch");
             startActivity(a.intent);
         } catch (Exception e) {
@@ -324,6 +328,7 @@ public class MainActivity extends Activity implements HomeView.Host {
     // ------------------------------------------------------------- overlays
 
     private FrameLayout openOverlay(boolean fullGlass) {
+        HomeWatcherService.cancelCleanup();
         closeOverlay(false);
         overlay = new FrameLayout(this);
         if (fullGlass) {
@@ -466,7 +471,7 @@ public class MainActivity extends Activity implements HomeView.Host {
             ((TextView) v.findViewWithTag("value")).setText(c24 ? "24-hour" : "12-hour");
             hv.updateClock();
         }));
-        list.addView(settingRow("Free memory when switching apps", prefs.getBoolean("freeMem", true) ? "On" : "Off", v -> {
+        list.addView(settingRow("Free memory on Home", prefs.getBoolean("freeMem", true) ? "On" : "Off", v -> {
             boolean on = !prefs.getBoolean("freeMem", true);
             prefs.edit().putBoolean("freeMem", on).apply();
             ((TextView) v.findViewWithTag("value")).setText(on ? "On" : "Off");

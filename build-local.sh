@@ -4,8 +4,8 @@
 # openjdk@17) and on the original Linux box (/tmp/tools). Override any path with
 # BT=<build-tools dir> AJ=<android.jar> JDK=<jdk bin dir>.
 set -euo pipefail
-VERSION_CODE=5
-VERSION_NAME=1.4
+VERSION_CODE=6
+VERSION_NAME=1.5
 
 SDK=/opt/homebrew/share/android-commandlinetools
 if [ -d "$SDK/build-tools/34.0.0" ]; then

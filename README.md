@@ -44,13 +44,14 @@ takes about 5 seconds to take over fully.
 - **Your apps, your order.** Add, remove and reorder dock apps from the remote.
 - **Wallpaper picker** with previews and photographer credits.
 - **Tasks:** see which apps are running and how much memory each uses, and
-  close the ones you've left open in the background.
+  close the ones you've left open in the background. Apps that won't close
+  normally are force-stopped through their App info page.
 - **Gentle on memory.** The Fire TV Stick has little RAM, and heavy streaming
   apps use a lot of it. Clean Launcher:
   - drops its images while you're watching something;
-  - clears apps left open in the background when you open a new one;
-  - steps in automatically if memory runs low. It never closes the app you're
-    watching or any Amazon system app.
+  - when memory runs low, closes the apps you've left in the background the
+    next time you press Home (Spotify and the app you're watching are left
+    alone).
 - **Dark mode**, plus a list layout if you prefer it to the dock.
 
 ## How the Home button works

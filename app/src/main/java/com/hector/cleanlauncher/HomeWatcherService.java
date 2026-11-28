@@ -10,6 +10,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.widget.Toast;
 import android.graphics.PixelFormat;
 import android.os.Handler;
@@ -204,9 +205,10 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
     // ------------------------------------------------------- low-memory watchdog
 
-    private static final long MEM_CHECK_MS = 30000, MEM_KILL_GAP_MS = 60000;
+    private static final long MEM_CHECK_MS = 30000;
     private static final long MEM_LOW_BYTES = 350L * 1024 * 1024;
-    private long lastMemKillAt;
+    /** Set by the watchdog, cleared by a cleanup: memory was low since the last one. */
+    private static boolean memLow;
     private final Runnable memCheck = new Runnable() {
         @Override public void run() {
             handler.postDelayed(this, MEM_CHECK_MS);   // plain Handler: no wakelock
@@ -215,30 +217,92 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     };
 
     /**
-     * Cached apps piling up behind a heavy one is what wedged the stick: when memory is low,
-     * drop the background processes of every launchable app except the one in front.
+     * Only notes that memory is low. Force-stopping needs the Settings screen, which would flash
+     * over whatever is playing, so the cleanup waits for the next Home press (see onHomeShown).
      */
     private void watchMemory() {
         if (!getSharedPreferences("home", MODE_PRIVATE).getBoolean("freeMem", true)) return;
-        long now = SystemClock.uptimeMillis();
-        if (lastMemKillAt != 0 && now - lastMemKillAt < MEM_KILL_GAP_MS) return;
         android.app.ActivityManager.MemoryInfo mi = Tasks.memory(this);
         if (!mi.lowMemory && mi.availMem >= MEM_LOW_BYTES) return;
-        if (checker == null) return;
-        final long availMb = mi.availMem / (1024 * 1024);
-        final boolean low = mi.lowMemory;
-        lastMemKillAt = now;
-        final List<String> pkgs = AppCatalog.get(this).packages();
-        checker.post(() -> {
-            String top = topAppPackage();
-            if (top == null) {
-                Log.d(TAG, "low memory (" + availMb + " MB free) but front app unknown, not killing");
-                return;
-            }
-            Log.d(TAG, "low memory (" + availMb + " MB free, lowMemory=" + low + "), front app " + top);
-            AppCatalog.killAll(this, pkgs, top, "watchdog");
-        });
+        if (!memLow) {
+            Log.d(TAG, "cleanup: memory is low (" + (mi.availMem / (1024 * 1024)) + " MB free, lowMemory="
+                    + mi.lowMemory + "); will clean up on the next Home press");
+        }
+        memLow = true;
     }
+
+    // ------------------------------------------------- cleanup when Home is shown
+
+    private static final long CLEANUP_GAP_MS = 3 * 60 * 1000, CLEANUP_DELAY_MS = 1000;
+    private static final long CLEANUP_LOW_BYTES = 400L * 1024 * 1024, CLEANUP_TARGET_BYTES = 550L * 1024 * 1024;
+    private static final int CLEANUP_MAX_APPS = 3;
+    private long lastCleanupAt;
+
+    /** MainActivity came to the front (Home press or return from an app), not the first start. */
+    static void onHomeShown() {
+        HomeWatcherService s = instance;
+        if (s != null) s.scheduleCleanup();
+    }
+
+    /** The user launched an app or opened a panel: no cleanup now. */
+    static void cancelCleanup() {
+        HomeWatcherService s = instance;
+        if (s != null) s.handler.removeCallbacks(s.cleanupRun);
+    }
+
+    private void scheduleCleanup() {
+        handler.removeCallbacks(cleanupRun);
+        if (fsActive) return;   // returning from our own force-stop flow
+        if (!getSharedPreferences("home", MODE_PRIVATE).getBoolean("freeMem", true)) return;
+        long now = SystemClock.uptimeMillis();
+        if (lastCleanupAt != 0 && now - lastCleanupAt < CLEANUP_GAP_MS) return;
+        if (!memLow && Tasks.memory(this).availMem >= CLEANUP_LOW_BYTES) return;
+        Log.d(TAG, "cleanup: scheduled (memLow=" + memLow + ")");
+        handler.postDelayed(cleanupRun, CLEANUP_DELAY_MS);
+    }
+
+    private final Runnable cleanupRun = new Runnable() {
+        @Override public void run() {
+            if (fsActive) return;
+            lastCleanupAt = SystemClock.uptimeMillis();
+            memLow = false;
+            final Map<String, AppEntry> known = new HashMap<>(AppCatalog.get(HomeWatcherService.this).apps());
+            new Thread(() -> {
+                Tasks.Snapshot snap = null;
+                try {
+                    snap = Tasks.processes(HomeWatcherService.this, known);
+                } catch (Throwable ignored) { }
+                if (snap == null) {
+                    Log.w(TAG, "cleanup: couldn't read running apps (DUMP / usage access?)");
+                    return;
+                }
+                long avail = Tasks.memory(HomeWatcherService.this).availMem;
+                List<Map.Entry<String, Long>> cand = new ArrayList<>();
+                for (Map.Entry<String, Long> e : snap.kb.entrySet()) {
+                    String p = e.getKey();
+                    Integer k = snap.kind.get(p);
+                    if (AppCatalog.isProtected(HomeWatcherService.this, p) || p.equals(snap.top)
+                            || (k != null && k == Tasks.KIND_FOREGROUND) || !known.containsKey(p)) continue;
+                    cand.add(e);
+                }
+                Collections.sort(cand, (x, y) -> Long.compare(y.getValue(), x.getValue()));
+                final List<String[]> pick = new ArrayList<>();
+                for (Map.Entry<String, Long> e : cand) {
+                    if (avail >= CLEANUP_TARGET_BYTES || pick.size() >= CLEANUP_MAX_APPS) break;
+                    pick.add(new String[]{e.getKey(), known.get(e.getKey()).label, String.valueOf(e.getValue())});
+                    avail += e.getValue() * 1024;
+                }
+                Log.i(TAG, "cleanup: " + cand.size() + " candidates, stopping " + pick.size()
+                        + ", estimated free " + (avail / (1024 * 1024)) + " MB");
+                if (pick.isEmpty()) return;
+                handler.post(() -> {
+                    // Only announce once there is something to close.
+                    Toast.makeText(HomeWatcherService.this, "Freeing memory…", Toast.LENGTH_SHORT).show();
+                    if (!forceStop(pick, true)) Log.w(TAG, "cleanup: force-stop flow unavailable");
+                });
+            }, "cleanup").start();
+        }
+    };
 
     @Override
     public void onTrimMemory(int level) {
@@ -275,12 +339,20 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
     private long fsDeadline, fsConfirmUntil;
     
     private int fsPageWindow = -1, fsDone, fsTotal;
+    private boolean fsHome;
+    private long fsFreedKb, fsKb;
+    private final List<String> fsFreed = new ArrayList<>();
 
     /**
      * Force-stop each {pkg, label} through the system App info page, one after another, then
      * return to the Tasks panel. Returns false if the service isn't running or is busy.
      */
     static boolean forceStop(List<String[]> items) {
+        return forceStop(items, false);
+    }
+
+    /** returnHome: automatic cleanup, which ends on the home screen instead of the Tasks panel. */
+    static boolean forceStop(List<String[]> items, boolean returnHome) {
         HomeWatcherService s = instance;
         if (s == null || s.fsActive || items.isEmpty()) return false;
         for (String[] it : items) {
@@ -288,6 +360,9 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         }
         if (s.fsQueue.isEmpty()) return false;
         s.fsActive = true;
+        s.fsHome = returnHome;
+        s.fsFreedKb = 0;
+        s.fsFreed.clear();
         s.fsDone = 0;
         s.fsTotal = s.fsQueue.size();
         s.fsNext();
@@ -302,6 +377,11 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         String[] it = fsQueue.remove(0);
         fsPkg = it[0];
         fsLabel = it[1];
+        try {
+            fsKb = it.length > 2 ? Long.parseLong(it[2]) : 0;
+        } catch (NumberFormatException e) {
+            fsKb = 0;
+        }
         fsStage = S_PAGE;
         fsAttempt = 0;
         fsGen++;
@@ -323,7 +403,11 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
 
     private void fsItemDone(boolean ok) {
         handler.removeCallbacks(fsTick);
-        if (ok) fsDone++;
+        if (ok) {
+            fsDone++;
+            fsFreedKb += fsKb;
+            fsFreed.add(fsLabel);
+        }
         fsPkg = null;
         fsNext();
     }
@@ -334,8 +418,14 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
         String msg = fsTotal == 1
                 ? (fsDone == 1 ? "Closed " + fsLabel : "Couldn't close " + fsLabel)
                 : "Closed " + fsDone + " of " + fsTotal + " apps";
-        Log.i(TAG, "forcestop: returned to Tasks (" + msg + ")");
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+        if (fsHome) {
+            msg = fsFreed.isEmpty() ? null : "Freed ~" + (fsFreedKb / 1024) + " MB ("
+                    + TextUtils.join(", ", fsFreed) + ")";
+            Log.i(TAG, "cleanup: done, " + (msg == null ? "nothing closed" : msg));
+        } else {
+            Log.i(TAG, "forcestop: returned to Tasks (" + msg + ")");
+        }
+        if (msg != null) Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
         try {
             // Don't leave the last App info page behind in the Settings task.
             AccessibilityNodeInfo r = getRootInActiveWindow();
@@ -347,10 +437,11 @@ public class HomeWatcherService extends AccessibilityService implements HomeView
             Log.w(TAG, "forcestop: couldn't go back: " + e);
         }
         try {
-            startActivity(new Intent(this, MainActivity.class)
+            Intent back = new Intent(this, MainActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP
-                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                    .putExtra(EXTRA_OPEN, OPEN_TASKS));
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            if (!fsHome) back.putExtra(EXTRA_OPEN, OPEN_TASKS);
+            startActivity(back);
         } catch (Exception e) {
             Log.w(TAG, "forcestop: couldn't return to Tasks: " + e);
         }
